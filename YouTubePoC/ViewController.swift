@@ -122,6 +122,138 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             (document.head || document.documentElement).appendChild(style);
           };
 
+          const updateChannelPageClass = () => {
+            const path = String(location.pathname || '');
+            const isChannelPage = /^\/@[^/]+(?:\/|$)/.test(path) ||
+              /^\/channel\//.test(path) ||
+              /^\/c\//.test(path) ||
+              /^\/user\//.test(path);
+            document.documentElement.classList.toggle('ray-channel-page', isChannelPage);
+          };
+
+          const ensureChannelLayoutFix = () => {
+            if (document.getElementById('ray-channel-layout-fix')) return;
+            const style = document.createElement('style');
+            style.id = 'ray-channel-layout-fix';
+            style.textContent = `
+              html.ray-channel-page,
+              html.ray-channel-page body,
+              html.ray-channel-page ytd-app,
+              html.ray-channel-page ytd-page-manager,
+              html.ray-channel-page #page-manager,
+              html.ray-channel-page ytd-browse,
+              html.ray-channel-page ytd-two-column-browse-results-renderer,
+              html.ray-channel-page ytd-two-column-browse-results-renderer #primary,
+              html.ray-channel-page ytd-two-column-browse-results-renderer #contents,
+              html.ray-channel-page ytd-rich-grid-renderer,
+              html.ray-channel-page ytd-grid-renderer,
+              html.ray-channel-page ytd-c4-tabbed-header-renderer,
+              html.ray-channel-page ytd-tabbed-page-header,
+              html.ray-channel-page #channel-container,
+              html.ray-channel-page #tabsContent {
+                width: 100% !important;
+                max-width: 100vw !important;
+                min-width: 0 !important;
+                margin-left: 0 !important;
+                margin-right: 0 !important;
+                box-sizing: border-box !important;
+              }
+
+              html.ray-channel-page body,
+              html.ray-channel-page #page-manager,
+              html.ray-channel-page ytd-browse {
+                overflow-x: hidden !important;
+              }
+
+              html.ray-channel-page ytd-browse #primary,
+              html.ray-channel-page ytd-browse #contents,
+              html.ray-channel-page ytd-browse #tabsContent {
+                padding-left: 8px !important;
+                padding-right: 8px !important;
+                box-sizing: border-box !important;
+              }
+
+              html.ray-channel-page ytd-rich-grid-renderer {
+                --ytd-rich-grid-items-per-row: 2 !important;
+                --ytd-rich-grid-posts-per-row: 2 !important;
+                --ytd-rich-grid-item-margin: 6px !important;
+                --ytd-rich-grid-row-margin: 14px !important;
+              }
+
+              html.ray-channel-page ytd-rich-grid-row,
+              html.ray-channel-page ytd-rich-grid-row #contents,
+              html.ray-channel-page ytd-grid-renderer #items {
+                width: 100% !important;
+                max-width: 100% !important;
+                min-width: 0 !important;
+                box-sizing: border-box !important;
+              }
+
+              html.ray-channel-page ytd-rich-grid-row #contents,
+              html.ray-channel-page ytd-grid-renderer #items {
+                display: grid !important;
+                grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+                gap: 14px 10px !important;
+                align-items: start !important;
+              }
+
+              html.ray-channel-page ytd-rich-item-renderer,
+              html.ray-channel-page ytd-grid-video-renderer {
+                width: auto !important;
+                min-width: 0 !important;
+                max-width: 100% !important;
+                margin: 0 !important;
+                box-sizing: border-box !important;
+              }
+
+              html.ray-channel-page ytd-rich-item-renderer #content,
+              html.ray-channel-page ytd-grid-video-renderer #dismissible,
+              html.ray-channel-page ytd-thumbnail,
+              html.ray-channel-page ytd-thumbnail a,
+              html.ray-channel-page ytd-thumbnail yt-image,
+              html.ray-channel-page ytd-thumbnail img {
+                width: 100% !important;
+                max-width: 100% !important;
+                min-width: 0 !important;
+                box-sizing: border-box !important;
+              }
+
+              html.ray-channel-page ytd-rich-item-renderer #video-title,
+              html.ray-channel-page ytd-grid-video-renderer #video-title {
+                max-width: 100% !important;
+                overflow: hidden !important;
+                display: -webkit-box !important;
+                -webkit-line-clamp: 2 !important;
+                -webkit-box-orient: vertical !important;
+              }
+
+              html.ray-channel-page tp-yt-paper-tabs,
+              html.ray-channel-page #tabsContainer,
+              html.ray-channel-page #tabsContent {
+                width: 100% !important;
+                max-width: 100vw !important;
+                min-width: 0 !important;
+              }
+
+              html.ray-channel-page tp-yt-paper-tabs {
+                overflow-x: auto !important;
+                overflow-y: hidden !important;
+                scrollbar-width: none !important;
+              }
+
+              html.ray-channel-page tp-yt-paper-tabs::-webkit-scrollbar {
+                display: none !important;
+              }
+
+              html.ray-channel-page tp-yt-paper-tab,
+              html.ray-channel-page yt-tab-shape {
+                flex: 0 0 auto !important;
+                min-width: max-content !important;
+              }
+            `;
+            (document.head || document.documentElement).appendChild(style);
+          };
+
           const ensureFullscreenOverride = () => {
             const player = document.querySelector('.html5-video-player');
             const button = player?.querySelector('.ytp-fullscreen-button');
@@ -210,6 +342,8 @@ final class ViewController: UIViewController, WKNavigationDelegate {
           let refreshPending = false;
           const refresh = () => {
             ensurePhoneLayoutFix();
+            ensureChannelLayoutFix();
+            updateChannelPageClass();
             forceAllInline();
             ensurePiPButton();
             ensureFullscreenOverride();
