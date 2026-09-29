@@ -1,6 +1,7 @@
 import UIKit
 import WebKit
 import MediaPlayer
+import AVFAudio
 
 final class ScriptBridge: NSObject, WKScriptMessageHandler {
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -12,6 +13,8 @@ final class ScriptBridge: NSObject, WKScriptMessageHandler {
 final class ViewController: UIViewController, WKNavigationDelegate {
     private let scriptBridge = ScriptBridge()
     private let webView: WKWebView
+    private var wasPlayingBeforeBackground = false
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     init() {
         let config = WKWebViewConfiguration()
@@ -163,6 +166,49 @@ final class ViewController: UIViewController, WKNavigationDelegate {
           };
 
           const forceAllInline = () => document.querySelectorAll('video').forEach(forceInline);
+
+          let __rayShouldKeepPlaying = false;
+          let __rayAppResigning = false;
+
+          const rememberPlaybackIntent = (video) => {
+            if (!(video instanceof HTMLVideoElement)) return;
+            if (!video.paused && !video.ended) __rayShouldKeepPlaying = true;
+          };
+
+          const resumeHiddenPlayback = (reason) => {
+            const video = document.querySelector('video');
+            if (!(video instanceof HTMLVideoElement) || !__rayShouldKeepPlaying) return;
+
+            const attempt = () => {
+              if (!document.hidden && reason !== 'native-background') return;
+              if (!video.paused && !video.ended) return;
+              try {
+                const promise = video.play();
+                promise?.then?.(() => {
+                  window.webkit?.messageHandlers?.diag?.postMessage({
+                    kind:'backgroundResume', reason, ok:true, paused:video.paused
+                  });
+                }).catch?.((error) => {
+                  window.webkit?.messageHandlers?.diag?.postMessage({
+                    kind:'backgroundResume', reason, ok:false, error:String(error), paused:video.paused
+                  });
+                });
+              } catch (error) {
+                window.webkit?.messageHandlers?.diag?.postMessage({
+                  kind:'backgroundResume', reason, ok:false, error:String(error), paused:video.paused
+                });
+              }
+            };
+
+            attempt();
+            setTimeout(attempt, 120);
+            setTimeout(attempt, 450);
+            setTimeout(attempt, 1100);
+          };
+
+          window.__raySetKeepPlaying = (value) => { __rayShouldKeepPlaying = !!value; };
+          window.__raySetAppResigning = (value) => { __rayAppResigning = !!value; };
+          window.__rayResumeHiddenPlayback = () => resumeHiddenPlayback('native-background');
 
           const ensurePhoneLayoutFix = () => {
             if (document.getElementById('ray-phone-layout-fix')) return;
@@ -648,6 +694,7 @@ final class ViewController: UIViewController, WKNavigationDelegate {
               forceInline(event.target);
               const v = event.target;
               if (v instanceof HTMLVideoElement) {
+                __rayShouldKeepPlaying = true;
                 window.webkit?.messageHandlers?.diag?.postMessage({
                   kind:'videoCaps',
                   webkitPresentationMode:String(v.webkitPresentationMode || ''),
@@ -655,6 +702,25 @@ final class ViewController: UIViewController, WKNavigationDelegate {
                   documentPiP:!!document.pictureInPictureEnabled
                 });
               }
+            }, true);
+            document.addEventListener('pause', (event) => {
+              const v = event.target;
+              if (v instanceof HTMLVideoElement && !document.hidden && !__rayAppResigning) {
+                __rayShouldKeepPlaying = false;
+              }
+            }, true);
+            document.addEventListener('visibilitychange', () => {
+              const v = document.querySelector('video');
+              if (document.hidden) {
+                rememberPlaybackIntent(v);
+                resumeHiddenPlayback('visibilitychange');
+              }
+              window.webkit?.messageHandlers?.diag?.postMessage({
+                kind:'visibility',
+                hidden:document.hidden,
+                paused:v instanceof HTMLVideoElement ? v.paused : null,
+                keepPlaying:__rayShouldKeepPlaying
+              });
             }, true);
             document.addEventListener('loadedmetadata', (event) => forceInline(event.target), true);
             document.addEventListener('webkitpresentationmodechanged', (event) => {
@@ -709,7 +775,7 @@ final class ViewController: UIViewController, WKNavigationDelegate {
         webView.navigationDelegate = self
         webView.load(URLRequest(url: URL(string: "https://www.youtube.com/")!))
         setupRemoteCommands()
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = [MPMediaItemPropertyTitle: "YouTube iOS PoC"]
+        setupLifecycleObservers()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -719,22 +785,104 @@ final class ViewController: UIViewController, WKNavigationDelegate {
     }
 
     private func setupRemoteCommands() {
+        UIApplication.shared.beginReceivingRemoteControlEvents()
         let center = MPRemoteCommandCenter.shared()
+        center.playCommand.isEnabled = true
+        center.pauseCommand.isEnabled = true
+        center.togglePlayPauseCommand.isEnabled = true
+
         center.playCommand.addTarget { [weak self] _ in
             print("[PoC] remote play")
-            self?.js("(()=>{let v=document.querySelector('video');if(!v)return 'no-video';v.play();return 'play-issued'})()", label: "remote-play")
+            self?.activateAudioSession(reason: "remote-play")
+            self?.js("(()=>{let v=document.querySelector('video');if(!v)return 'no-video';window.__raySetKeepPlaying?.(true);v.play();return 'play-issued'})()", label: "remote-play")
             return .success
         }
         center.pauseCommand.addTarget { [weak self] _ in
             print("[PoC] remote pause")
-            self?.js("(()=>{let v=document.querySelector('video');if(!v)return 'no-video';v.pause();return 'pause-issued'})()", label: "remote-pause")
+            self?.activateAudioSession(reason: "remote-pause")
+            self?.js("(()=>{let v=document.querySelector('video');if(!v)return 'no-video';window.__raySetKeepPlaying?.(false);v.pause();return 'pause-issued'})()", label: "remote-pause")
             return .success
         }
         center.togglePlayPauseCommand.addTarget { [weak self] _ in
             print("[PoC] remote toggle")
-            self?.js("(()=>{let v=document.querySelector('video');if(!v)return 'no-video';if(v.paused){v.play();return 'play-issued'}else{v.pause();return 'pause-issued'}})()", label: "remote-toggle")
+            self?.activateAudioSession(reason: "remote-toggle")
+            self?.js("(()=>{let v=document.querySelector('video');if(!v)return 'no-video';if(v.paused){window.__raySetKeepPlaying?.(true);v.play();return 'play-issued'}else{window.__raySetKeepPlaying?.(false);v.pause();return 'pause-issued'}})()", label: "remote-toggle")
             return .success
         }
+    }
+
+    private func setupLifecycleObservers() {
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(handleWillResignActive),
+                                               name: UIApplication.willResignActiveNotification,
+                                               object: nil)
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(handleDidEnterBackground),
+                                               name: UIApplication.didEnterBackgroundNotification,
+                                               object: nil)
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(handleDidBecomeActive),
+                                               name: UIApplication.didBecomeActiveNotification,
+                                               object: nil)
+    }
+
+    @objc private func handleWillResignActive() {
+        js("window.__raySetAppResigning?.(true); 'resigning-set'", label: "will-resign-js")
+        webView.evaluateJavaScript("(()=>{let v=document.querySelector('video');return v?{paused:v.paused,ended:v.ended,currentTime:v.currentTime}:null})()") { [weak self] value, error in
+            guard let self else { return }
+            if let state = value as? [String: Any],
+               let paused = state["paused"] as? Bool,
+               let ended = state["ended"] as? Bool {
+                self.wasPlayingBeforeBackground = !paused && !ended
+            } else {
+                self.wasPlayingBeforeBackground = false
+            }
+            print("[PoC] willResignActive wasPlaying=\(self.wasPlayingBeforeBackground) state=\(String(describing: value)) error=\(String(describing: error))")
+        }
+    }
+
+    @objc private func handleDidEnterBackground() {
+        print("[PoC] VC didEnterBackground wasPlaying=\(wasPlayingBeforeBackground)")
+        activateAudioSession(reason: "background")
+        if backgroundTask == .invalid {
+            backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "ResumeWebPlayback") { [weak self] in
+                guard let self else { return }
+                if self.backgroundTask != .invalid {
+                    UIApplication.shared.endBackgroundTask(self.backgroundTask)
+                    self.backgroundTask = .invalid
+                }
+            }
+        }
+
+        resumeWebPlayback(reason: "native-background-now")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.resumeWebPlayback(reason: "native-background-200ms")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            self?.resumeWebPlayback(reason: "native-background-800ms")
+            guard let self, self.backgroundTask != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(self.backgroundTask)
+            self.backgroundTask = .invalid
+        }
+    }
+
+    @objc private func handleDidBecomeActive() {
+        print("[PoC] VC didBecomeActive")
+        activateAudioSession(reason: "foreground")
+        js("window.__raySetAppResigning?.(false); 'active-set'", label: "did-become-active-js")
+    }
+
+    private func activateAudioSession(reason: String) {
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+            print("[PoC] audioSession active reason=\(reason)")
+        } catch {
+            print("[PoC] audioSession error reason=\(reason) error=\(error)")
+        }
+    }
+
+    private func resumeWebPlayback(reason: String) {
+        js("(()=>{let v=document.querySelector('video');if(!v)return 'no-video';window.__raySetKeepPlaying?.(true);window.__rayResumeHiddenPlayback?.();if(!v.paused&&!v.ended)return 'already-playing';v.play().catch(e=>window.webkit?.messageHandlers?.diag?.postMessage({kind:'nativeResumeError',reason:'\(reason)',error:String(e)}));return 'play-issued'})()", label: reason)
     }
 
     private func js(_ script: String, label: String? = nil) {
