@@ -18,6 +18,14 @@
 - 频道资料区和 Tab 栏限制在手机视口内，Tab 可横向滚动。
 - 频道视频列表在窄屏下改为两列自适应网格。
 
+## 2.2
+
+- 恢复左上角汉堡菜单：保留 YouTube 原生 guide drawer，仅隐藏常驻 mini-guide，手机端仍保持全宽布局。
+- 自动跳过 YouTube 可跳过广告：检测到真实“跳过”按钮后，由 WKWebView 原生点击 SPI 触发用户交互点击。
+- 真机日志已验证自动跳过事件链为 `mousedown -> mouseup -> click`，且 `isTrusted = true`，两次测试均返回 `success=true`。
+- 自动跳过功能带本地持久日志 `Documents/adskip.log`，便于后续诊断。
+- 自动跳广告依赖运行时可用的 WebKit 私有 SPI；不可用时会自动保持原有手工跳过行为，不影响正常播放。
+
 ## iOS 后台播放说明
 
 在当前 iOS / WKWebView 实现中，稳定后台播放依赖系统 PiP 媒体会话。播放视频后先点击播放器中的 **“画中画 / 后台播放”** 按钮进入 PiP，再回到桌面即可持续播放。直接从普通 inline 播放状态退出 App，iOS 会暂停 WKWebView 视频。

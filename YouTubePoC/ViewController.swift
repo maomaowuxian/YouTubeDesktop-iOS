@@ -2,15 +2,33 @@ import UIKit
 import WebKit
 
 final class ScriptBridge: NSObject, WKScriptMessageHandler {
+    var onAdSkipRequest: ((String) -> Void)?
+    var onDiagnostic: ((Any) -> Void)?
+
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.name == "diag" else { return }
-        print("[YouTubeDesktop][JS] \(message.body)")
+        switch message.name {
+        case "diag":
+            print("[YouTubeDesktop][JS] \(message.body)")
+            onDiagnostic?(message.body)
+        case "adSkip":
+            guard
+                let body = message.body as? [String: Any],
+                let text = body["text"] as? String,
+                !text.isEmpty
+            else { return }
+            print("[YouTubeDesktop][AdSkip] JS requested native click text=\(text)")
+            onAdSkipRequest?(text)
+        default:
+            break
+        }
     }
 }
 
 final class ViewController: UIViewController, WKNavigationDelegate {
     private let scriptBridge = ScriptBridge()
     private let webView: WKWebView
+    private var adSkipClickInFlight = false
+    private var lastAdSkipClickAt = Date.distantPast
 
     init() {
         let config = WKWebViewConfiguration()
@@ -19,6 +37,7 @@ final class ViewController: UIViewController, WKNavigationDelegate {
         config.allowsAirPlayForMediaPlayback = true
         config.allowsPictureInPictureMediaPlayback = true
         config.userContentController.add(scriptBridge, name: "diag")
+        config.userContentController.add(scriptBridge, name: "adSkip")
 
         let pageTweaks = #"""
         (() => {
@@ -28,6 +47,62 @@ final class ViewController: UIViewController, WKNavigationDelegate {
           const post = (body) => {
             try { window.webkit?.messageHandlers?.diag?.postMessage(body); } catch (_) {}
           };
+
+          const adSkipSelectors = [
+            '.ytp-skip-ad-button',
+            '.ytp-ad-skip-button',
+            '.ytp-ad-skip-button-modern',
+            'button[id^="skip-button"]'
+          ];
+
+          const findVisibleSkipButton = () => {
+            const player = document.querySelector('.html5-video-player');
+            if (!player?.classList.contains('ad-showing')) return null;
+            for (const selector of adSkipSelectors) {
+              for (const button of player.querySelectorAll(selector)) {
+                if (!(button instanceof HTMLElement)) continue;
+                const rect = button.getBoundingClientRect();
+                const style = getComputedStyle(button);
+                if (rect.width < 2 || rect.height < 2) continue;
+                if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) <= 0) continue;
+                return button;
+              }
+            }
+            return null;
+          };
+
+          let lastAdSkipText = '';
+          let lastAdSkipRequestAt = 0;
+          const scanForSkippableAd = () => {
+            const button = findVisibleSkipButton();
+            if (!button) return;
+
+            const rawText = String(button.innerText || button.textContent || button.getAttribute('aria-label') || '');
+            const text = rawText.replace(/\s+/g, ' ').trim();
+            if (!text) return;
+
+            const now = Date.now();
+            if (text === lastAdSkipText && now - lastAdSkipRequestAt < 1200) return;
+            lastAdSkipText = text;
+            lastAdSkipRequestAt = now;
+
+            post({kind:'adSkipDetected', text, id:button.id || '', cls:String(button.className || '').slice(0,180)});
+            try { window.webkit?.messageHandlers?.adSkip?.postMessage({text}); } catch (_) {}
+          };
+
+          for (const type of ['mousedown', 'mouseup', 'click']) {
+            document.addEventListener(type, (event) => {
+              const target = event.target instanceof Element ? event.target : null;
+              const button = target?.closest?.(adSkipSelectors.join(','));
+              if (!button) return;
+              post({
+                kind:'adSkipEvent',
+                type,
+                isTrusted:!!event.isTrusted,
+                text:String(button.innerText || button.textContent || '').replace(/\s+/g, ' ').trim()
+              });
+            }, true);
+          }
 
           const forceInline = (video) => {
             if (!(video instanceof HTMLVideoElement)) return;
@@ -52,11 +127,6 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             style.id = 'ray-phone-layout-fix';
             style.textContent = `
               ytd-mini-guide-renderer,
-              ytd-guide-renderer,
-              tp-yt-app-drawer#guide,
-              #guide,
-              #guide-content,
-              #guide-inner-content,
               #guide-spacer,
               #mini-guide-background {
                 display: none !important;
@@ -65,6 +135,16 @@ final class ViewController: UIViewController, WKNavigationDelegate {
                 max-width: 0 !important;
                 margin: 0 !important;
                 padding: 0 !important;
+              }
+
+              /* Keep YouTube's real guide drawer alive so the hamburger
+                 button can still open the overlay menu. Only the persistent
+                 mini-guide above is suppressed for the phone layout. */
+              tp-yt-app-drawer#guide,
+              tp-yt-app-drawer#guide ytd-guide-renderer,
+              tp-yt-app-drawer#guide #guide-content,
+              tp-yt-app-drawer#guide #guide-inner-content {
+                box-sizing: border-box !important;
               }
 
               ytd-app,
@@ -360,13 +440,17 @@ final class ViewController: UIViewController, WKNavigationDelegate {
 
           const start = () => {
             refresh();
+            scanForSkippableAd();
 
             new MutationObserver((mutations) => {
               for (const mutation of mutations) {
                 for (const node of mutation.addedNodes) forceInlineInNode(node);
               }
               scheduleRefresh();
+              scanForSkippableAd();
             }).observe(document.documentElement, {childList:true, subtree:true});
+
+            setInterval(scanForSkippableAd, 350);
 
             document.addEventListener('yt-navigate-finish', scheduleRefresh, true);
             document.addEventListener('yt-page-data-updated', scheduleRefresh, true);
@@ -391,6 +475,18 @@ final class ViewController: UIViewController, WKNavigationDelegate {
 
         webView = WKWebView(frame: .zero, configuration: config)
         super.init(nibName: nil, bundle: nil)
+        scriptBridge.onAdSkipRequest = { [weak self] text in
+            self?.requestNativeAdSkipClick(matching: text)
+        }
+        scriptBridge.onDiagnostic = { [weak self] body in
+            guard
+                let self,
+                let dictionary = body as? [String: Any],
+                let kind = dictionary["kind"] as? String,
+                kind.hasPrefix("adSkip")
+            else { return }
+            self.appendAdSkipLog("JS \(dictionary)")
+        }
     }
 
     required init?(coder: NSCoder) {
@@ -416,7 +512,74 @@ final class ViewController: UIViewController, WKNavigationDelegate {
     override func viewDidLoad() {
         super.viewDidLoad()
         webView.navigationDelegate = self
+        let selector = NSSelectorFromString("_simulateClickOverFirstMatchingTextInViewportWithUserInteraction:completionHandler:")
+        let available = webView.responds(to: selector)
+        print("[YouTubeDesktop][AdSkip] private click SPI available=\(available)")
+        appendAdSkipLog("SPI available=\(available)")
         webView.load(URLRequest(url: URL(string: "https://www.youtube.com/")!))
+    }
+
+    private func appendAdSkipLog(_ message: String) {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let line = "[\(formatter.string(from: Date()))] \(message)\n"
+
+        guard let data = line.data(using: .utf8) else { return }
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("adskip.log")
+
+        do {
+            if FileManager.default.fileExists(atPath: url.path) {
+                let handle = try FileHandle(forWritingTo: url)
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+                try handle.close()
+            } else {
+                try data.write(to: url, options: .atomic)
+            }
+        } catch {
+            print("[YouTubeDesktop][AdSkip] persistent log error=\(error)")
+        }
+    }
+
+    private func requestNativeAdSkipClick(matching text: String) {
+        let now = Date()
+        guard !adSkipClickInFlight else { return }
+        guard now.timeIntervalSince(lastAdSkipClickAt) >= 0.8 else { return }
+
+        let selector = NSSelectorFromString("_simulateClickOverFirstMatchingTextInViewportWithUserInteraction:completionHandler:")
+        guard webView.responds(to: selector) else {
+            print("[YouTubeDesktop][AdSkip] private click SPI unavailable")
+            appendAdSkipLog("SPI unavailable text=\(text)")
+            return
+        }
+
+        adSkipClickInFlight = true
+        lastAdSkipClickAt = now
+
+        typealias CompletionBlock = @convention(block) (Bool) -> Void
+        typealias PrivateClickIMP = @convention(c) (AnyObject, Selector, NSString, CompletionBlock) -> Void
+
+        let completion: CompletionBlock = { [weak self] success in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.adSkipClickInFlight = false
+                print("[YouTubeDesktop][AdSkip] private click completed success=\(success) text=\(text)")
+                self.appendAdSkipLog("SPI completion success=\(success) text=\(text)")
+            }
+        }
+
+        guard let implementation = webView.method(for: selector) else {
+            adSkipClickInFlight = false
+            print("[YouTubeDesktop][AdSkip] method implementation unavailable")
+            appendAdSkipLog("method implementation unavailable text=\(text)")
+            return
+        }
+
+        let function = unsafeBitCast(implementation, to: PrivateClickIMP.self)
+        print("[YouTubeDesktop][AdSkip] invoking private click text=\(text)")
+        appendAdSkipLog("SPI invoke text=\(text)")
+        function(webView, selector, text as NSString, completion)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
