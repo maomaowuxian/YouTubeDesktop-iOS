@@ -2,20 +2,21 @@
 
 一个基于 `WKWebView` 的 iPhone YouTube 桌面版封装项目。
 
-## 当前已验证功能
+## 2.0 基线功能
 
 - YouTube 桌面版页面
-- 视频页移动端布局适配
-- 后台音频播放
-- 锁屏 / 灵动岛媒体状态
+- 视频页单列 / 手机宽度布局适配
 - 画中画（PiP）
 - iOS 原生全屏播放
-- 系统媒体播放 / 暂停命令桥接
+- PiP 状态下稳定后台音频播放
+- PiP 状态下使用系统媒体卡片 / 耳机控制
 - 自定义 App 图标
 
-## 当前实验功能
+## iOS 后台播放说明
 
-- 自动处理 YouTube 可跳过广告：仍在实验和真机验证阶段，当前版本尚未形成稳定方案。
+在当前 iOS / WKWebView 实现中，稳定后台播放依赖系统 PiP 媒体会话。播放视频后先点击播放器中的 **“画中画 / 后台播放”** 按钮进入 PiP，再回到桌面即可持续播放。直接从普通 inline 播放状态退出 App，iOS 会暂停 WKWebView 视频。
+
+2.0 已移除自动跳广告、后台强制续播、可见性伪装、程序化后台 PiP、RemoteCommand 播放桥等未形成稳定方案的实验代码。
 
 ## 开发环境
 
@@ -27,4 +28,4 @@
 
 `com.ray.YouTubeIOSPoC`
 
-> 项目显示名称已经改为 **YouTube Desktop**。工程 target / bundle identifier 暂时保持原值，以避免影响现有签名和真机安装。
+> 项目显示名称为 **YouTube Desktop**。工程 target / bundle identifier 保持原值，以避免影响现有签名和真机安装。
