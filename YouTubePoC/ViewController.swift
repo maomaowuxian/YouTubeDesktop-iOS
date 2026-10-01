@@ -8,7 +8,11 @@ final class ScriptBridge: NSObject, WKScriptMessageHandler {
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         switch message.name {
         case "diag":
-            print("[YouTubeDesktop][JS] \(message.body)")
+            // Media request URLs contain ephemeral signatures. Keep the source
+            // message in memory and exclude it from all console/file logging.
+            if (message.body as? [String: Any])?["kind"] as? String != "nativeSource" {
+                print("[YouTubeDesktop][JS] \(message.body)")
+            }
             onDiagnostic?(message.body)
         case "adSkip":
             guard
@@ -27,6 +31,10 @@ final class ScriptBridge: NSObject, WKScriptMessageHandler {
 final class ViewController: UIViewController, WKNavigationDelegate {
     private let scriptBridge = ScriptBridge()
     private let webView: WKWebView
+    private let nativeAudioProbe = NativeAudioSourceProbe()
+    private let nativePlayback = NativePiPPlayback()
+    private var lastMediaState: [String: Any] = [:]
+    private var didRunNativeSmokeTest = false
     private var adSkipClickInFlight = false
     private var lastAdSkipClickAt = Date.distantPast
 
@@ -35,7 +43,21 @@ final class ViewController: UIViewController, WKNavigationDelegate {
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
         config.allowsAirPlayForMediaPlayback = true
-        config.allowsPictureInPictureMediaPlayback = true
+        // PiP uses the app-owned AVPlayer; prevent the WebKit fullscreen
+        // controls from starting a second PiP session through the old path.
+        config.allowsPictureInPictureMediaPlayback = false
+        do {
+            // The page selects HLS and transforms its media URL before handoff.
+            for name in ["_setMediaSourceEnabled:", "_setManagedMediaSourceEnabled:"] {
+                let selector = NSSelectorFromString(name)
+                let preferences = config.preferences
+                if preferences.responds(to: selector), let implementation = preferences.method(for: selector) {
+                    typealias Setter = @convention(c) (AnyObject, Selector, Bool) -> Void
+                    unsafeBitCast(implementation, to: Setter.self)(preferences, selector, false)
+                    PlaybackAudioSession.shared.log("NATIVE_SOURCE HLS preference disabled \(name)")
+                }
+            }
+        }
         config.userContentController.add(scriptBridge, name: "diag")
         config.userContentController.add(scriptBridge, name: "adSkip")
 
@@ -46,6 +68,136 @@ final class ViewController: UIViewController, WKNavigationDelegate {
 
           const post = (body) => {
             try { window.webkit?.messageHandlers?.diag?.postMessage(body); } catch (_) {}
+          };
+
+
+          // Observe completed media requests without consuming response bodies.
+          // Signed URLs stay in memory and are never printed in diagnostics.
+          let sourceVideoID = '';
+          const seenSources = new Set();
+          const sourceOwners = new Map();
+          const observeMediaURL = (rawURL, declaredMime = '') => {
+            try {
+              const videoID = new URL(location.href).searchParams.get('v') || '';
+              if (!videoID || document.querySelector('.html5-video-player')?.classList.contains('ad-showing')) return;
+              if (sourceVideoID !== videoID) { sourceVideoID = videoID; seenSources.clear(); }
+              const url = new URL(rawURL, location.href);
+              if (url.protocol !== 'https:' ||
+                  !(url.hostname === 'googlevideo.com' || url.hostname.endsWith('.googlevideo.com'))) return;
+              const hls = /^\/api\/manifest\/hls_(playlist|variant)(\/|$)/.test(url.pathname);
+              if (hls) {
+                // Only a current player response may introduce a manifest.
+                // Buffered resource entries may still belong to the previous video.
+                if (declaredMime !== 'application/vnd.apple.mpegurl') return;
+                const key = 'hls:' + videoID + ':' + url.toString();
+                if (seenSources.has(key) || seenSources.size >= 4) return;
+                seenSources.add(key);
+                post({kind:'nativeSource', videoID, url:url.toString(), mime:'application/vnd.apple.mpegurl'});
+                return;
+              }
+              if (url.pathname !== '/videoplayback') return;
+              const mime = url.searchParams.get('mime') || declaredMime.split(';')[0].trim();
+              if (!mime.startsWith('audio/') && mime !== 'video/mp4') return;
+              const signed = new Set((url.searchParams.get('sparams') || '').split(',').concat(
+                (url.searchParams.get('lsparams') || '').split(',')));
+              for (const name of ['range', 'rn', 'rbuf', 'ump']) {
+                if (url.searchParams.has(name) && signed.has(name)) return;
+                url.searchParams.delete(name);
+              }
+              const key = (url.searchParams.get('itag') || '') + ':' + mime +
+                ':' + (url.searchParams.get('id') || '');
+              const previousOwner = sourceOwners.get(key);
+              if (previousOwner && previousOwner !== videoID) return;
+              if (seenSources.has(key) || seenSources.size >= 4) return;
+              if (sourceOwners.size >= 256) sourceOwners.delete(sourceOwners.keys().next().value);
+              sourceOwners.set(key, videoID);
+              seenSources.add(key);
+              post({kind:'nativeSource', videoID, url:url.toString(), mime});
+            } catch (_) {}
+          };
+          let lastSourceInventory = '';
+          const scanPlayerSources = () => {
+            try {
+              const videoID = new URL(location.href).searchParams.get('v') || '';
+              if (!videoID || document.querySelector('.html5-video-player')?.classList.contains('ad-showing')) return null;
+              const response = document.getElementById('movie_player')?.getPlayerResponse?.();
+              // The player may still describe the previous SPA video.
+              if (response?.videoDetails?.videoId !== videoID) return null;
+              const data = response.streamingData;
+              if (!data) return null;
+              const formats = [...(data.formats || []), ...(data.adaptiveFormats || [])];
+              let hlsEndpoint = 'none', hlsHost = 'none';
+              try {
+                const manifest = new URL(data.hlsManifestUrl);
+                hlsEndpoint = manifest.pathname.split('/').slice(0, 4).join('/');
+                hlsHost = manifest.hostname;
+              } catch (_) {}
+              const inventory = {kind:'nativeSourceInventory', videoID,
+                formats:formats.length, direct:formats.filter(f => typeof f.url === 'string').length,
+                cipher:formats.filter(f => f.signatureCipher || f.cipher).length,
+                audio:formats.filter(f => String(f.mimeType || '').startsWith('audio/')).length,
+                hls:!!data.hlsManifestUrl, hlsHost, hlsEndpoint, dash:!!data.dashManifestUrl,
+                sabr:!!data.serverAbrStreamingUrl};
+              const key = JSON.stringify(inventory);
+              if (key !== lastSourceInventory) { lastSourceInventory = key; post(inventory); }
+              // Only use already available URLs. Never guess or bypass signatures.
+              // Capture the URL the current video actually uses, after the
+              // YouTube player has applied its own challenge transformation.
+              try {
+                const video = document.querySelector('.html5-video-player video');
+                const actual = new URL(video?.currentSrc || '');
+                const reference = new URL(data.hlsManifestUrl || '');
+                const pathValue = (url, key) => url.searchParams.get(key) ||
+                  decodeURIComponent(url.pathname.match(new RegExp('/' + key + '/([^/]+)'))?.[1] || '');
+                if (Number.isFinite(video?.duration) &&
+                    Math.abs(video.duration - Number(response.videoDetails.lengthSeconds)) < 3 &&
+                    pathValue(reference, 'id') &&
+                    pathValue(actual, 'id') === pathValue(reference, 'id') &&
+                    pathValue(actual, 'expire') === pathValue(reference, 'expire')) {
+                  observeMediaURL(actual.toString(), 'application/vnd.apple.mpegurl');
+                }
+              } catch (_) {}
+              return response;
+            } catch (_) { return null; }
+          };
+          window.__rayNativePiPOwner = '';
+          window.__rayNativePiPVideo = null;
+          window.__rayNativePiPMetadata = null;
+          window.__rayResetPiPButton = () => {
+            const button = document.querySelector('.ray-pip-button');
+            if (button) { button.disabled = false; button.title = '画中画 / 后台播放'; }
+          };
+          window.__rayPauseForNativePiP = (videoID) => {
+            if (new URL(location.href).searchParams.get('v') !== videoID ||
+                document.querySelector('.html5-video-player')?.classList.contains('ad-showing')) return null;
+            const video = document.querySelector('.html5-video-player video');
+            if (!video || !Number.isFinite(video.currentTime)) return null;
+            const wasPlaying = !video.paused;
+            window.__rayNativePiPOwner = videoID;
+            window.__rayNativePiPVideo = video;
+            window.__rayNativePiPMetadata = navigator.mediaSession?.metadata || null;
+            video.pause();
+            try {
+              navigator.mediaSession.playbackState = 'none';
+              navigator.mediaSession.metadata = null;
+            } catch (_) {}
+            return {videoID, currentTime:video.currentTime, wasPlaying, paused:video.paused};
+          };
+          window.__rayRestoreAfterNativePiP = (videoID, time, play) => {
+            window.__rayResetPiPButton();
+            if (window.__rayNativePiPOwner !== videoID) return false;
+            const video = window.__rayNativePiPVideo;
+            const metadata = window.__rayNativePiPMetadata;
+            window.__rayNativePiPOwner = '';
+            window.__rayNativePiPVideo = null;
+            window.__rayNativePiPMetadata = null;
+            if (new URL(location.href).searchParams.get('v') !== videoID || !video?.isConnected ||
+                document.querySelector('.html5-video-player video') !== video) return false;
+            video.pause();
+            try { video.currentTime = Math.max(0, Math.min(time, Number.isFinite(video.duration) ? video.duration : time)); } catch (_) {}
+            try { navigator.mediaSession.metadata = metadata; } catch (_) {}
+            if (play) video.play()?.catch?.(() => post({kind:'nativeRestoreFailed'}));
+            return true;
           };
 
           const adSkipSelectors = [
@@ -103,6 +255,41 @@ final class ViewController: UIViewController, WKNavigationDelegate {
               });
             }, true);
           }
+
+          const reportMediaState = (event = 'snapshot') => {
+            const sourceResponse = scanPlayerSources();
+            const videos = Array.from(document.querySelectorAll('video'));
+            const pipVideo = videos.find(v => v.webkitPresentationMode === 'picture-in-picture' ||
+              document.pictureInPictureElement === v);
+            const video = pipVideo || document.querySelector('.html5-video-player video') || videos[0];
+            let transport = 'unknown';
+            try {
+              const data = document.getElementById('movie_player')?.getPlayerResponse?.()?.streamingData;
+              transport = data?.serverAbrStreamingUrl ? 'SABR' : (data ? 'adaptive' : 'unknown');
+            } catch (_) {}
+            post({
+              kind:'mediaState', event, pip:!!pipVideo,
+              videoID:new URL(location.href).searchParams.get('v') || '',
+              ad:!!document.querySelector('.html5-video-player')?.classList.contains('ad-showing'),
+              transport,
+              sourceKind:video?.currentSrc?.startsWith('blob:') ? 'MSE' :
+                (video?.currentSrc?.startsWith('https:') ? 'URL' : 'none'),
+              sourceDuration:Number(sourceResponse?.videoDetails?.lengthSeconds) || 0,
+              paused:video ? !!video.paused : true,
+              ended:video ? !!video.ended : false,
+              currentTime:video ? video.currentTime : 0,
+              readyState:video ? video.readyState : 0,
+              muted:video ? !!video.muted : false,
+              volume:video ? video.volume : 0,
+              duration:video && Number.isFinite(video.duration) ? video.duration : 0,
+              title:String(navigator.mediaSession?.metadata?.title ||
+                document.querySelector('h1.ytd-watch-metadata')?.textContent || document.title || '').trim(),
+              artist:String(navigator.mediaSession?.metadata?.artist ||
+                document.querySelector('ytd-watch-metadata #channel-name')?.textContent || '').trim(),
+              mode:video ? String(video.webkitPresentationMode || 'inline') : 'none',
+              visibility:document.visibilityState
+            });
+          };
 
           const forceInline = (video) => {
             if (!(video instanceof HTMLVideoElement)) return;
@@ -393,23 +580,18 @@ final class ViewController: UIViewController, WKNavigationDelegate {
               }
 
               forceInline(video);
-              let method = 'none';
-              try {
-                if (typeof video.webkitSupportsPresentationMode === 'function' &&
-                    typeof video.webkitSetPresentationMode === 'function' &&
-                    video.webkitSupportsPresentationMode('picture-in-picture')) {
-                  method = 'webkitSetPresentationMode';
-                  video.webkitSetPresentationMode('picture-in-picture');
-                } else if (document.pictureInPictureEnabled && typeof video.requestPictureInPicture === 'function') {
-                  method = 'requestPictureInPicture';
-                  video.requestPictureInPicture()?.catch?.((error) => {
-                    post({kind:'pipError', method, error:String(error)});
-                  });
-                }
-                post({kind:'pipRequest', ok:method !== 'none', method});
-              } catch (error) {
-                post({kind:'pipError', method, error:String(error)});
+              const videoID = new URL(location.href).searchParams.get('v') || '';
+              if (!videoID || player.classList.contains('ad-showing')) {
+                post({kind:'pipError', message:'请在视频内容开始播放后进入画中画。'});
+                return;
               }
+              const rect = video.getBoundingClientRect();
+              button.disabled = true;
+              button.title = '正在准备画中画';
+              reportMediaState('nativePiPRequest');
+              post({kind:'nativePiPRequest', videoID, ad:false,
+                rect:{x:rect.x/innerWidth, y:rect.y/innerHeight,
+                      width:rect.width/innerWidth, height:rect.height/innerHeight}});
             }, true);
 
             if (fullscreen && fullscreen.parentElement === controls) {
@@ -451,8 +633,43 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             }).observe(document.documentElement, {childList:true, subtree:true});
 
             setInterval(scanForSkippableAd, 350);
+            setInterval(scanPlayerSources, 2000);
+            document.addEventListener('yt-navigate-start', () => {
+              post({kind:'nativeNavigation'});
+              sourceVideoID = '';
+              seenSources.clear();
+              lastSourceInventory = '';
+              window.__rayNativePiPOwner = '';
+              window.__rayNativePiPVideo = null;
+              window.__rayNativePiPMetadata = null;
+              window.__rayResetPiPButton();
+            }, true);
 
-            document.addEventListener('yt-navigate-finish', scheduleRefresh, true);
+            document.addEventListener('yt-navigate-finish', () => {
+              scheduleRefresh();
+              reportMediaState('navigation');
+            }, true);
+            for (const type of ['play', 'playing', 'pause', 'ended', 'waiting', 'error',
+                                'volumechange', 'enterpictureinpicture', 'leavepictureinpicture']) {
+              document.addEventListener(type, (event) => {
+                if (!(event.target instanceof HTMLVideoElement)) return;
+                if ((type === 'play' || type === 'playing') &&
+                    window.__rayNativePiPOwner && window.__rayNativePiPVideo === event.target) {
+                  event.target.pause();
+                }
+                reportMediaState(type);
+              }, true);
+            }
+            document.addEventListener('visibilitychange', () => reportMediaState('visibility'), true);
+            let lastProgressLogAt = 0;
+            document.addEventListener('timeupdate', (event) => {
+              if (!(event.target instanceof HTMLVideoElement)) return;
+              if (event.target.webkitPresentationMode !== 'picture-in-picture') return;
+              const now = Date.now();
+              if (now - lastProgressLogAt < 15000) return;
+              lastProgressLogAt = now;
+              reportMediaState('progress');
+            }, true);
             document.addEventListener('yt-page-data-updated', scheduleRefresh, true);
             window.addEventListener('popstate', scheduleRefresh, true);
             document.addEventListener('play', (event) => forceInline(event.target), true);
@@ -461,6 +678,7 @@ final class ViewController: UIViewController, WKNavigationDelegate {
               const video = event.target;
               if (video instanceof HTMLVideoElement) {
                 post({kind:'presentationMode', mode:String(video.webkitPresentationMode || '')});
+                reportMediaState('presentation');
               }
             }, true);
           };
@@ -475,6 +693,27 @@ final class ViewController: UIViewController, WKNavigationDelegate {
 
         webView = WKWebView(frame: .zero, configuration: config)
         super.init(nibName: nil, bundle: nil)
+        nativePlayback.webView = webView
+        nativeAudioProbe.onCompatible = { [weak self] id, asset in
+            self?.nativePlayback.prepare(videoID: id, asset: asset)
+        }
+        nativePlayback.onError = { [weak self] message in
+            guard let self, UIApplication.shared.applicationState == .active,
+                  self.presentedViewController == nil else { return }
+            let alert = UIAlertController(title: "画中画", message: message, preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "好", style: .default))
+            self.present(alert, animated: true)
+        }
+        nativePlayback.onReady = { [weak self] id in
+            #if DEBUG
+            guard let self, !self.didRunNativeSmokeTest,
+                  ProcessInfo.processInfo.environment["YOUTUBE_NATIVE_PIP_SMOKE"] == "1",
+                  self.lastMediaState["videoID"] as? String == id,
+                  !self.nativePlayback.ownsPlayback else { return }
+            self.didRunNativeSmokeTest = true
+            self.nativePlayback.request(self.lastMediaState)
+            #endif
+        }
         scriptBridge.onAdSkipRequest = { [weak self] text in
             self?.requestNativeAdSkipClick(matching: text)
         }
@@ -482,10 +721,28 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             guard
                 let self,
                 let dictionary = body as? [String: Any],
-                let kind = dictionary["kind"] as? String,
-                kind.hasPrefix("adSkip")
+                let kind = dictionary["kind"] as? String
             else { return }
-            self.appendAdSkipLog("JS \(dictionary)")
+            if kind.hasPrefix("adSkip") {
+                self.appendAdSkipLog("JS \(dictionary)")
+            } else if kind == "nativeSource" {
+                self.nativeAudioProbe.receive(dictionary)
+            } else if kind == "nativeSourceInventory" {
+                PlaybackAudioSession.shared.log("NATIVE_SOURCE inventory \(dictionary)")
+            } else if kind == "nativePiPRequest" {
+                var request = self.lastMediaState
+                request.merge(dictionary) { _, new in new }
+                self.nativePlayback.request(request)
+            } else if kind == "nativeNavigation" {
+                self.nativePlayback.navigationWillChange()
+                self.nativeAudioProbe.update([:])
+            } else if kind == "pipError", let message = dictionary["message"] as? String {
+                self.nativePlayback.onError?(message)
+            } else if kind == "nativeRestoreFailed" {
+                PlaybackAudioSession.shared.log("native PiP returned, webpage play failed")
+            } else if kind == "mediaState" {
+                self.handleMediaState(dictionary)
+            }
         }
     }
 
@@ -513,10 +770,34 @@ final class ViewController: UIViewController, WKNavigationDelegate {
         super.viewDidLoad()
         webView.navigationDelegate = self
         let selector = NSSelectorFromString("_simulateClickOverFirstMatchingTextInViewportWithUserInteraction:completionHandler:")
+        PlaybackAudioSession.shared.log("native HLS PiP enabled; inline playback remains WebKit")
         let available = webView.responds(to: selector)
         print("[YouTubeDesktop][AdSkip] private click SPI available=\(available)")
         appendAdSkipLog("SPI available=\(available)")
-        webView.load(URLRequest(url: URL(string: "https://www.youtube.com/")!))
+        var initialURL = URL(string: "https://www.youtube.com/")!
+        #if DEBUG
+        if let id = ProcessInfo.processInfo.environment["YOUTUBE_SOURCE_PROBE_VIDEO"],
+           id.range(of: "^[A-Za-z0-9_-]{11}$", options: .regularExpression) != nil {
+            initialURL = URL(string: "https://www.youtube.com/watch?v=\(id)")!
+            PlaybackAudioSession.shared.log("NATIVE_SOURCE foreground diagnostic launch")
+        }
+        #endif
+        webView.load(URLRequest(url: initialURL))
+    }
+
+    private func handleMediaState(_ state: [String: Any]) {
+        lastMediaState = state
+        nativeAudioProbe.update(state)
+        if !nativePlayback.ownsPlayback {
+            PlaybackAudioSession.shared.update(playing: !(state["paused"] as? Bool ?? true),
+                                               pip: state["pip"] as? Bool ?? false)
+        }
+        PlaybackAudioSession.shared.log("JS \(state)")
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        nativeAudioProbe.update([:])
+        PlaybackAudioSession.shared.log("WebContent terminated; nativePlaybackActive=\(nativePlayback.ownsPlayback)")
     }
 
     private func appendAdSkipLog(_ message: String) {
