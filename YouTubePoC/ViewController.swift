@@ -164,14 +164,22 @@ final class ViewController: UIViewController, WKNavigationDelegate {
           window.__rayNativePiPVideo = null;
           window.__rayNativePiPMetadata = null;
           window.__rayResetPiPButton = () => {
-            const button = document.querySelector('.ray-pip-button');
-            if (button) { button.disabled = false; button.title = '画中画 / 后台播放'; }
+            const pipButton = document.querySelector('.ray-pip-button');
+            if (pipButton) { pipButton.disabled = false; pipButton.title = '画中画 / 后台播放'; }
+            const audioButton = document.querySelector('.ray-audio-button');
+            if (audioButton) { audioButton.disabled = false; audioButton.title = '后台音频'; }
           };
-          window.__rayPauseForNativePiP = (videoID) => {
+          window.__rayPauseForNativePiP = (videoID, automaticSource = '') => {
             if (new URL(location.href).searchParams.get('v') !== videoID ||
                 document.querySelector('.html5-video-player')?.classList.contains('ad-showing')) return null;
             const video = document.querySelector('.html5-video-player video');
             if (!video || !Number.isFinite(video.currentTime)) return null;
+            if (automaticSource) {
+              const response = document.getElementById('movie_player')?.getPlayerResponse?.();
+              if (video.paused || video.ended || window.__rayNativePiPOwner ||
+                  response?.videoDetails?.videoId !== videoID ||
+                  video.currentSrc !== automaticSource) return null;
+            }
             const wasPlaying = !video.paused;
             window.__rayNativePiPOwner = videoID;
             window.__rayNativePiPVideo = video;
@@ -601,6 +609,41 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             }
           };
 
+          const ensureAudioButton = () => {
+            const player = document.querySelector('.html5-video-player');
+            const pipButton = player?.querySelector('.ray-pip-button');
+            if (!player || !pipButton || player.querySelector('.ray-audio-button')) return;
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'ytp-button ray-audio-button';
+            button.setAttribute('aria-label', '后台音频');
+            button.setAttribute('title', '后台音频');
+            button.style.width = '48px';
+            button.style.padding = '0 8px';
+            button.innerHTML = '<svg viewBox="0 0 36 36" width="100%" height="100%" aria-hidden="true"><path fill="currentColor" d="M18 7a11 11 0 0 0-11 11v9h7V16h-4a8 8 0 0 1 16 0h-4v11h7v-9A11 11 0 0 0 18 7z"></path></svg>';
+            button.addEventListener('click', (event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              const video = player.querySelector('video');
+              const videoID = new URL(location.href).searchParams.get('v') || '';
+              if (!(video instanceof HTMLVideoElement) || !videoID ||
+                  player.classList.contains('ad-showing')) {
+                post({kind:'pipError', message:'请在视频内容开始播放后开启后台音频。'});
+                return;
+              }
+              forceInline(video);
+              const rect = video.getBoundingClientRect();
+              button.disabled = true;
+              pipButton.disabled = true;
+              button.title = '正在准备后台音频';
+              reportMediaState('nativeAudioRequest');
+              post({kind:'nativeAudioRequest', playbackMode:'audio', videoID, ad:false,
+                rect:{x:rect.x/innerWidth, y:rect.y/innerHeight,
+                      width:rect.width/innerWidth, height:rect.height/innerHeight}});
+            }, true);
+            pipButton.parentElement.insertBefore(button, pipButton);
+          };
+
           let refreshPending = false;
           const refresh = () => {
             ensurePhoneLayoutFix();
@@ -608,6 +651,7 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             updateChannelPageClass();
             forceAllInline();
             ensurePiPButton();
+            ensureAudioButton();
             ensureFullscreenOverride();
           };
 
@@ -664,9 +708,9 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             let lastProgressLogAt = 0;
             document.addEventListener('timeupdate', (event) => {
               if (!(event.target instanceof HTMLVideoElement)) return;
-              if (event.target.webkitPresentationMode !== 'picture-in-picture') return;
               const now = Date.now();
-              if (now - lastProgressLogAt < 15000) return;
+              const interval = event.target.webkitPresentationMode === 'picture-in-picture' ? 15000 : 5000;
+              if (now - lastProgressLogAt < interval) return;
               lastProgressLogAt = now;
               reportMediaState('progress');
             }, true);
@@ -694,24 +738,46 @@ final class ViewController: UIViewController, WKNavigationDelegate {
         webView = WKWebView(frame: .zero, configuration: config)
         super.init(nibName: nil, bundle: nil)
         nativePlayback.webView = webView
-        nativeAudioProbe.onCompatible = { [weak self] id, asset in
-            self?.nativePlayback.prepare(videoID: id, asset: asset)
+        nativeAudioProbe.onCompatible = { [weak self] id, asset, player in
+            self?.nativePlayback.prepare(videoID: id, asset: asset, verifiedPlayer: player)
         }
         nativePlayback.onError = { [weak self] message in
             guard let self, UIApplication.shared.applicationState == .active,
                   self.presentedViewController == nil else { return }
-            let alert = UIAlertController(title: "画中画", message: message, preferredStyle: .alert)
+            let alert = UIAlertController(title: "播放", message: message, preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "好", style: .default))
             self.present(alert, animated: true)
         }
         nativePlayback.onReady = { [weak self] id in
+            guard let self else { return }
+            self.nativePlayback.primeAudioPosition(self.lastMediaState)
+            self.maybeAutomaticallyTakeOver()
             #if DEBUG
-            guard let self, !self.didRunNativeSmokeTest,
-                  ProcessInfo.processInfo.environment["YOUTUBE_NATIVE_PIP_SMOKE"] == "1",
+            guard !self.didRunNativeSmokeTest,
+                  (ProcessInfo.processInfo.environment["YOUTUBE_NATIVE_PIP_SMOKE"] == "1" ||
+                   ProcessInfo.processInfo.environment["YOUTUBE_NATIVE_AUDIO_SMOKE"] == "1" ||
+                   ProcessInfo.processInfo.environment["YOUTUBE_AUTOMATIC_HANDOFF_SMOKE"] == "1"),
                   self.lastMediaState["videoID"] as? String == id,
                   !self.nativePlayback.ownsPlayback else { return }
             self.didRunNativeSmokeTest = true
-            self.nativePlayback.request(self.lastMediaState)
+            var request = self.lastMediaState
+            if ProcessInfo.processInfo.environment["YOUTUBE_NATIVE_AUDIO_SMOKE"] == "1" {
+                request["playbackMode"] = "audio"
+            }
+            if ProcessInfo.processInfo.environment["YOUTUBE_AUTOMATIC_HANDOFF_SMOKE"] == "1" {
+                // Exercises the same request/snapshot; not evidence of real lock timing.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    guard let self else { return }
+                    self.nativePlayback.requestAutomatic(self.lastMediaState)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
+                    guard let self, UIApplication.shared.applicationState == .active else { return }
+                    PlaybackAudioSession.shared.log("AUTO_HANDOFF debug foreground return check")
+                    self.nativePlayback.applicationBecameActive()
+                }
+            } else {
+                self.nativePlayback.request(request)
+            }
             #endif
         }
         scriptBridge.onAdSkipRequest = { [weak self] text in
@@ -729,11 +795,12 @@ final class ViewController: UIViewController, WKNavigationDelegate {
                 self.nativeAudioProbe.receive(dictionary)
             } else if kind == "nativeSourceInventory" {
                 PlaybackAudioSession.shared.log("NATIVE_SOURCE inventory \(dictionary)")
-            } else if kind == "nativePiPRequest" {
+            } else if kind == "nativePiPRequest" || kind == "nativeAudioRequest" {
                 var request = self.lastMediaState
                 request.merge(dictionary) { _, new in new }
                 self.nativePlayback.request(request)
             } else if kind == "nativeNavigation" {
+                self.lastMediaState = [:]
                 self.nativePlayback.navigationWillChange()
                 self.nativeAudioProbe.update([:])
             } else if kind == "pipError", let message = dictionary["message"] as? String {
@@ -785,9 +852,36 @@ final class ViewController: UIViewController, WKNavigationDelegate {
         webView.load(URLRequest(url: initialURL))
     }
 
+    private func maybeAutomaticallyTakeOver() {
+        guard UIApplication.shared.applicationState == .active,
+              presentedViewController == nil, !nativePlayback.ownsPlayback else { return }
+        #if DEBUG
+        let env = ProcessInfo.processInfo.environment
+        if ["YOUTUBE_NATIVE_PIP_SMOKE", "YOUTUBE_NATIVE_AUDIO_SMOKE",
+            "YOUTUBE_AUTOMATIC_HANDOFF_SMOKE", "YOUTUBE_WEB_ONLY_DIAGNOSTIC"].contains(where: { env[$0] == "1" }) {
+            return
+        }
+        #endif
+        // Complete the audible handoff while foreground. Locking only detaches
+        // the video surface; it no longer depends on a late WebKit snapshot.
+        nativePlayback.requestAutomatic(lastMediaState, foreground: true)
+    }
+
+    func applicationWillResignActive() {
+        nativePlayback.requestAutomatic(lastMediaState)
+    }
+
+    func applicationBecameActive() {
+        nativePlayback.applicationBecameActive()
+        nativeAudioProbe.update(lastMediaState)
+        maybeAutomaticallyTakeOver()
+    }
+
     private func handleMediaState(_ state: [String: Any]) {
         lastMediaState = state
         nativeAudioProbe.update(state)
+        nativePlayback.primeAudioPosition(state)
+        maybeAutomaticallyTakeOver()
         if !nativePlayback.ownsPlayback {
             PlaybackAudioSession.shared.update(playing: !(state["paused"] as? Bool ?? true),
                                                pip: state["pip"] as? Bool ?? false)
@@ -796,6 +890,7 @@ final class ViewController: UIViewController, WKNavigationDelegate {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        lastMediaState = [:]
         nativeAudioProbe.update([:])
         PlaybackAudioSession.shared.log("WebContent terminated; nativePlaybackActive=\(nativePlayback.ownsPlayback)")
     }
@@ -861,6 +956,12 @@ final class ViewController: UIViewController, WKNavigationDelegate {
         print("[YouTubeDesktop][AdSkip] invoking private click text=\(text)")
         appendAdSkipLog("SPI invoke text=\(text)")
         function(webView, selector, text as NSString, completion)
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        lastMediaState = [:]
+        nativePlayback.navigationWillChange()
+        nativeAudioProbe.update([:])
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {

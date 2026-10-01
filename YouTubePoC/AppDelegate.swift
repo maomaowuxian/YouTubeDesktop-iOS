@@ -8,17 +8,21 @@ import WebKit
 /// Verifies the actual webpage media URL in a paused player before PiP handoff.
 @MainActor
 final class NativeAudioSourceProbe {
-    var onCompatible: ((String, AVURLAsset) -> Void)?
+    var onCompatible: ((String, AVURLAsset, AVPlayer?) -> Void)?
     private var videoID = ""
     private var pip = false
     private var expectedDuration = 0.0
     private var candidates: [URL] = []
     private var attempted: Set<URL> = []
+    private var activeCandidate: URL?
     private var task: Task<Void, Never>?
     private var asset: AVURLAsset?
     private var probePlayer: AVPlayer?
     private var generation = 0
     private var foundCompatibleSource = false
+    #if DEBUG
+    private var didRunPreparationRetryCheck = false
+    #endif
 
     func receive(_ message: [String: Any]) {
         guard let id = message["videoID"] as? String, !id.isEmpty,
@@ -49,7 +53,7 @@ final class NativeAudioSourceProbe {
         }
         let active = ((media["pip"] as? Bool ?? false) || foregroundProbe) &&
             !(media["ad"] as? Bool ?? false)
-        if pip && !active { cancel() }
+        if pip && !active { cancel(retryInterrupted: true) }
         pip = active
         guard active else { return }
         if media["event"] as? String == "presentation" {
@@ -68,7 +72,12 @@ final class NativeAudioSourceProbe {
         foundCompatibleSource = false
     }
 
-    private func cancel() {
+    private func cancel(retryInterrupted: Bool = false) {
+        if retryInterrupted, let candidate = activeCandidate {
+            attempted.remove(candidate)
+            PlaybackAudioSession.shared.log("NATIVE_SOURCE interrupted preparation queued for foreground retry")
+        }
+        activeCandidate = nil
         generation += 1
         task?.cancel()
         task = nil
@@ -83,6 +92,7 @@ final class NativeAudioSourceProbe {
               task == nil, !foundCompatibleSource,
               let url = candidates.first(where: { !attempted.contains($0) }) else { return }
         attempted.insert(url)
+        activeCandidate = url
         generation += 1
         let currentGeneration = generation
         let expected = expectedDuration
@@ -101,12 +111,25 @@ final class NativeAudioSourceProbe {
             self.cancel()
             self.startIfPossible()
         }
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["YOUTUBE_PREPARATION_RETRY_SMOKE"] == "1",
+           !didRunPreparationRetryCheck {
+            didRunPreparationRetryCheck = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                guard let self, self.generation == currentGeneration, self.task != nil else { return }
+                PlaybackAudioSession.shared.log("NATIVE_SOURCE debug interrupt and retry check")
+                self.cancel(retryInterrupted: true)
+                self.startIfPossible()
+            }
+        }
+        #endif
         task = Task { [weak self] in
             do {
                 let playable = try await source.load(.isPlayable)
                 let duration = try await source.load(.duration).seconds
                 let tracks = try await source.loadTracks(withMediaType: .audio)
                 guard let self, !Task.isCancelled, self.generation == currentGeneration else { return }
+                var verifiedPlayer: AVPlayer?
                 var audioTracks = tracks.count
                 var videoTracks = try await source.loadTracks(withMediaType: .video).count
                 guard !Task.isCancelled, self.generation == currentGeneration else { return }
@@ -116,7 +139,8 @@ final class NativeAudioSourceProbe {
                     let item = AVPlayerItem(asset: source)
                     let player = AVPlayer(playerItem: item)
                     self.probePlayer = player
-                    defer { player.replaceCurrentItem(with: nil) }
+                    // Transfer this verified, paused player on success;
+                    // avoid repeating the HLS loading delay with another item.
                     for _ in 0..<40 {
                         if item.status != .unknown { break }
                         try await Task.sleep(nanoseconds: 250_000_000)
@@ -131,6 +155,11 @@ final class NativeAudioSourceProbe {
                     for event in item.errorLog()?.events.suffix(3) ?? [] {
                         PlaybackAudioSession.shared.log("NATIVE_SOURCE HLS error status=\(event.errorStatusCode) domain=\(event.errorDomain)")
                     }
+                    if item.status == .readyToPlay && itemAudio > 0 && itemVideo > 0 {
+                        verifiedPlayer = player
+                    } else {
+                        player.replaceCurrentItem(with: nil)
+                    }
                     self.probePlayer = nil
                 }
                 guard !Task.isCancelled, self.generation == currentGeneration else { return }
@@ -140,7 +169,12 @@ final class NativeAudioSourceProbe {
                 PlaybackAudioSession.shared.log("NATIVE_SOURCE metadata compatible=\(compatible) playable=\(playable) duration=\(duration) expected=\(expected) audioTracks=\(audioTracks)")
                 self.task = nil
                 self.asset = nil
-                if compatible { self.onCompatible?(self.videoID, source) }
+                self.activeCandidate = nil
+                if compatible {
+                    self.onCompatible?(self.videoID, source, verifiedPlayer)
+                } else {
+                    verifiedPlayer?.replaceCurrentItem(with: nil)
+                }
                 self.startIfPossible()
             } catch {
                 guard let self, !Task.isCancelled, self.generation == currentGeneration else { return }
@@ -150,6 +184,7 @@ final class NativeAudioSourceProbe {
                 PlaybackAudioSession.shared.log("NATIVE_SOURCE load failed domain=\(value.domain) code=\(value.code)")
                 self.task = nil
                 self.asset = nil
+                self.activeCandidate = nil
                 self.startIfPossible()
             }
         }
@@ -162,6 +197,44 @@ final class NativeAudioSourceProbe {
 private final class NativePlayerSurface: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+    private var audioPauseButton: UIButton?
+
+    func configureAudioControls(onToggle: @escaping () -> Void, onReturn: @escaping () -> Void) {
+        let pause = UIButton(type: .system)
+        let back = UIButton(type: .system)
+        for button in [pause, back] {
+            var config = UIButton.Configuration.filled()
+            config.baseBackgroundColor = UIColor.black.withAlphaComponent(0.7)
+            config.baseForegroundColor = .white
+            config.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12)
+            button.configuration = config
+        }
+        pause.setTitle("暂停", for: .normal)
+        pause.accessibilityLabel = "后台音频播放或暂停"
+        back.setTitle("返回网页", for: .normal)
+        pause.addAction(UIAction { _ in onToggle() }, for: .touchUpInside)
+        back.addAction(UIAction { _ in onReturn() }, for: .touchUpInside)
+        let controls = UIStackView(arrangedSubviews: [pause, back])
+        controls.spacing = 8
+        controls.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(controls)
+        NSLayoutConstraint.activate([
+            controls.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            controls.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8)
+        ])
+        audioPauseButton = pause
+    }
+
+    func updateAudioControls(playing: Bool) {
+        audioPauseButton?.setTitle(playing ? "暂停" : "播放", for: .normal)
+    }
+}
+
+/// Retry only the still-current user request, once, before any real progress.
+enum NativeResumeRecovery {
+    static func shouldRetry(wantsPlaying: Bool, ready: Bool, ended: Bool, delta: Double, attempt: Int) -> Bool {
+        wantsPlaying && ready && !ended && delta.isFinite && delta <= 0.1 && attempt == 0
+    }
 }
 
 @MainActor
@@ -170,6 +243,19 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
     var onError: ((String) -> Void)?
     var onReady: ((String) -> Void)?
     private(set) var ownsPlayback = false
+    private enum Mode: String { case pip, audio }
+    private var mode: Mode = .pip
+    private var handoffCompleted = false
+    private var automaticHandoff = false
+    private var automaticCancellationRequested = false
+    private var automaticStartupPending = false
+    private var handoffTime: Double?
+    private var audioActivated = false
+    private var handoffTask: UIBackgroundTaskIdentifier = .invalid
+    private var deferredRestoreScript: String?
+    private var lastPrimeAt = Date.distantPast
+    private var automaticSuppressedVideoID = ""
+    private var automaticRetryAfter = Date.distantPast
     private var videoID = ""
     private var asset: AVURLAsset?
     private var player: AVPlayer?
@@ -192,8 +278,11 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
     private var didRequestPiP = false
     private var lastProgressLog = Date.distantPast
     private var resumeAfterInterruption = false
+    private var resumeGeneration = 0
+    private var resumePending = false
+    private var resumeTask: UIBackgroundTaskIdentifier = .invalid
 
-    func prepare(videoID: String, asset: AVURLAsset) {
+    func prepare(videoID: String, asset: AVURLAsset, verifiedPlayer: AVPlayer? = nil) {
         guard !ownsPlayback else { return }
         if self.videoID == videoID, self.asset === asset, player != nil { return }
         preparationGeneration += 1
@@ -202,8 +291,8 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         player?.replaceCurrentItem(with: nil)
         self.videoID = videoID
         self.asset = asset
-        let item = AVPlayerItem(asset: asset)
-        let player = AVPlayer(playerItem: item)
+        let player = verifiedPlayer ?? AVPlayer(playerItem: AVPlayerItem(asset: asset))
+        guard let item = player.currentItem else { return }
         self.player = player
         itemObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             DispatchQueue.main.async {
@@ -220,7 +309,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
                     self.log("prepare failed domain=\(error?.domain ?? "none") code=\(error?.code ?? 0)")
                     if self.pendingRequest != nil {
                         self.pendingRequest = nil
-                        self.fail("这段视频暂时无法进入画中画，请稍后重试。")
+                        self.fail("这段视频暂时无法交给原生播放器，请稍后重试。")
                     }
                 }
             }
@@ -240,18 +329,89 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
             guard let self, self.generation == token, self.pendingRequest != nil else { return }
             self.pendingRequest = nil
-            self.fail("画中画准备超时，请稍后重试。")
+            self.fail("原生播放准备超时，请稍后重试。")
         }
+    }
+
+    /// Pre-seek only while foreground; never start a second audible player.
+    func primeAudioPosition(_ state: [String: Any]) {
+        guard !ownsPlayback, pendingRequest == nil,
+              UIApplication.shared.applicationState == .active,
+              state["videoID"] as? String == videoID,
+              !(state["ad"] as? Bool ?? true), !(state["paused"] as? Bool ?? true),
+              let time = state["currentTime"] as? Double, time.isFinite, time >= 0,
+              let player, player.currentItem?.status == .readyToPlay,
+              Date().timeIntervalSince(lastPrimeAt) >= 5 else { return }
+        lastPrimeAt = Date()
+        if abs(player.currentTime().seconds - time) > 3 {
+            player.seek(to: CMTime(seconds: time, preferredTimescale: 600),
+                        toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
+                        toleranceAfter: CMTime(seconds: 1, preferredTimescale: 600))
+        }
+    }
+
+    func requestAutomatic(_ state: [String: Any], foreground: Bool = false) {
+        if foreground && (automaticSuppressedVideoID == videoID || Date() < automaticRetryAfter) { return }
+        guard !ownsPlayback, pendingRequest == nil else {
+            log("AUTO_HANDOFF skipped native owner or manual request")
+            return
+        }
+        guard UIApplication.shared.applicationState != .background,
+              state["videoID"] as? String == videoID, !videoID.isEmpty,
+              !(state["ad"] as? Bool ?? true),
+              !(state["paused"] as? Bool ?? true),
+              !(state["ended"] as? Bool ?? true) else {
+            log("AUTO_HANDOFF skipped cached content not playing")
+            return
+        }
+        guard player?.currentItem?.status == .readyToPlay else {
+            log("AUTO_HANDOFF skipped native source not ready")
+            return
+        }
+        log("AUTO_HANDOFF trigger foreground=\(foreground) appState=\(UIApplication.shared.applicationState.rawValue)")
+        begin(state, automatic: true)
+    }
+
+    func applicationBecameActive() {
+        if automaticHandoff && ownsPlayback {
+            if handoffCompleted {
+                // Keep native ownership across unlock instead of another WebKit handoff.
+                updateAudioPresentation(background: false)
+                log("AUTO_HANDOFF retained native playback on foreground")
+            } else {
+                // Wait for the atomic page snapshot before restoring its position.
+                automaticCancellationRequested = true
+                log("AUTO_HANDOFF foreground cancellation requested")
+            }
+        }
+        if let script = deferredRestoreScript {
+            deferredRestoreScript = nil
+            webView?.evaluateJavaScript(script)
+            log("AUTO_HANDOFF deferred webpage restoration")
+        }
+    }
+
+    private func endHandoffTask() {
+        automaticStartupPending = false
+        guard handoffTask != .invalid else { return }
+        let task = handoffTask
+        handoffTask = .invalid
+        UIApplication.shared.endBackgroundTask(task)
     }
 
     func navigationWillChange() {
         pendingRequest = nil
+        deferredRestoreScript = nil
+        automaticSuppressedVideoID = ""
+        automaticRetryAfter = .distantPast
+        lastPrimeAt = .distantPast
         preparationGeneration += 1
         if ownsPlayback {
             pipController?.delegate = nil
             pipController?.stopPictureInPicture()
             finish(restorePlaying: false)
         }
+        deferredRestoreScript = nil
         itemObservation?.invalidate()
         itemObservation = nil
         player?.replaceCurrentItem(with: nil)
@@ -261,16 +421,27 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         generation += 1
     }
 
-    private func begin(_ state: [String: Any]) {
+    private func begin(_ state: [String: Any], automatic: Bool = false) {
+        let requestedMode: Mode = automatic || state["playbackMode"] as? String == "audio" ? .audio : .pip
         guard !ownsPlayback, let webView, let player,
               state["videoID"] as? String == videoID,
               player.currentItem?.status == .readyToPlay,
-              AVPictureInPictureController.isPictureInPictureSupported(),
-              UIApplication.shared.applicationState == .active else {
-            fail("当前无法启动画中画，请稍后重试。")
+              (requestedMode == .audio || AVPictureInPictureController.isPictureInPictureSupported()),
+              (UIApplication.shared.applicationState == .active ||
+               (automatic && UIApplication.shared.applicationState == .inactive)) else {
+            fail("当前无法开始原生播放，请稍后重试。")
             return
         }
+        mode = requestedMode
+        automaticHandoff = automatic
+        automaticCancellationRequested = false
+        handoffTime = nil
+        audioActivated = false
+        deferredRestoreScript = nil
+        handoffCompleted = false
         ownsPlayback = true
+        player.audiovisualBackgroundPlaybackPolicy = mode == .audio ? .continuesIfPossible : .automatic
+        log("handoff requested mode=\(mode.rawValue) automatic=\(automatic)")
         generation += 1
         let token = generation
         restoreRequested = false
@@ -278,18 +449,42 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         didRequestPiP = false
         let id = videoID
         let quotedID = quote(id)
-        webView.evaluateJavaScript("window.__rayPauseForNativePiP?.(\(quotedID))") { [weak self] result, error in
+        if automatic {
+            automaticStartupPending = true
+            handoffTask = UIApplication.shared.beginBackgroundTask(withName: "NativePlaybackHandoff") { [weak self] in
+                guard let self, self.generation == token, self.ownsPlayback else { return }
+                self.log("AUTO_HANDOFF task expired")
+                self.finish(restorePlaying: true)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, self.generation == token, self.ownsPlayback,
+                      self.automaticStartupPending else { return }
+                self.log("AUTO_HANDOFF timed out; restore on foreground")
+                self.finish(restorePlaying: self.handoffTime == nil || self.wantsPlaying)
+            }
+        }
+        // For automatic handoff, the page must still be playing this exact source.
+        // The URL is passed only in memory, never to diagnostics.
+        let sourceArgument = automatic ? ", \(quote(asset?.url.absoluteString ?? ""))" : ""
+        webView.evaluateJavaScript("window.__rayPauseForNativePiP?.(\(quotedID)\(sourceArgument))") { [weak self] result, error in
             guard let self, self.generation == token, self.ownsPlayback else { return }
             guard error == nil, let snapshot = result as? [String: Any],
                   snapshot["videoID"] as? String == id,
                   let time = snapshot["currentTime"] as? Double, time.isFinite,
                   snapshot["paused"] as? Bool == true,
-                  UIApplication.shared.applicationState == .active else {
-                self.finish(restorePlaying: false)
-                self.fail("播放状态已改变，请重新进入画中画。")
+                  (!automatic || snapshot["wasPlaying"] as? Bool == true),
+                  (automatic || UIApplication.shared.applicationState == .active) else {
+                self.log("AUTO_HANDOFF snapshot rejected automatic=\(automatic)")
+                self.finish(restorePlaying: automatic)
+                if !automatic { self.fail("播放状态已改变，请重新开始。") }
                 return
             }
             self.wantsPlaying = snapshot["wasPlaying"] as? Bool ?? true
+            self.handoffTime = time
+            if automatic && self.automaticCancellationRequested {
+                self.finish(restorePlaying: self.wantsPlaying)
+                return
+            }
             let view = NativePlayerSurface()
             view.backgroundColor = .black
             view.playerLayer.videoGravity = .resizeAspect
@@ -308,40 +503,61 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
             }
             webView.addSubview(view)
             self.surface = view
-            guard let pip = AVPictureInPictureController(playerLayer: view.playerLayer) else {
-                self.finish(restorePlaying: self.wantsPlaying)
-                self.fail("当前设备无法启动画中画。")
-                return
+            if self.mode == .audio && UIApplication.shared.applicationState != .active {
+                self.updateAudioPresentation(background: true)
             }
-            self.pipController = pip
-            pip.delegate = self
-            pip.canStartPictureInPictureAutomaticallyFromInline = false
+            if self.mode == .pip {
+                guard let pip = AVPictureInPictureController(playerLayer: view.playerLayer) else {
+                    self.finish(restorePlaying: self.wantsPlaying)
+                    self.fail("当前设备无法启动画中画。")
+                    return
+                }
+                self.pipController = pip
+                pip.delegate = self
+                pip.canStartPictureInPictureAutomaticallyFromInline = false
+                self.pipObservation = pip.observe(\.isPictureInPicturePossible, options: [.new]) { [weak self] _, _ in
+                    DispatchQueue.main.async { self?.tryStartPiP(token: token) }
+                }
+                self.displayObservation = view.playerLayer.observe(\.isReadyForDisplay, options: [.new]) { [weak self] _, _ in
+                    DispatchQueue.main.async { self?.tryStartPiP(token: token) }
+                }
+            } else {
+                view.configureAudioControls(onToggle: { [weak self] in self?.command("toggle") },
+                                            onReturn: { [weak self] in
+                    guard let self, self.ownsPlayback, self.mode == .audio else { return }
+                    self.automaticSuppressedVideoID = self.videoID
+                    self.finish(restorePlaying: self.wantsPlaying)
+                })
+            }
             do {
-                // The WebKit video has actually paused, and the app is foreground.
+                // WebKit has really paused. Automatic handoff races the background
+                // transition: log and roll back if iOS denies activation.
                 try AVAudioSession.sharedInstance().setActive(true)
+                self.audioActivated = true
+                self.log("handoff audio activated appState=\(UIApplication.shared.applicationState.rawValue)")
             } catch {
                 let value = error as NSError
                 self.log("handoff audio activation failed domain=\(value.domain) code=\(value.code)")
                 self.finish(restorePlaying: self.wantsPlaying)
-                self.fail("画中画音频初始化失败，请重试。")
+                if !automatic { self.fail("原生音频初始化失败，请重试。") }
                 return
             }
             self.installSession(state, player: player)
-            self.pipObservation = pip.observe(\.isPictureInPicturePossible, options: [.new]) { [weak self] _, _ in
-                DispatchQueue.main.async { self?.tryStartPiP(token: token) }
-            }
-            self.displayObservation = view.playerLayer.observe(\.isReadyForDisplay, options: [.new]) { [weak self] _, _ in
-                DispatchQueue.main.async { self?.tryStartPiP(token: token) }
-            }
             self.stateObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
                 DispatchQueue.main.async {
                     guard let self, self.generation == token, self.ownsPlayback else { return }
                     self.log("state=\(player.timeControlStatus.rawValue) rate=\(player.rate) time=\(player.currentTime().seconds)")
-                    if self.pipController?.isPictureInPictureActive == true && !self.isStoppingPiP {
-                        if player.timeControlStatus == .paused { self.wantsPlaying = false }
+                    if self.handoffCompleted &&
+                        (self.mode == .audio || self.pipController?.isPictureInPictureActive == true) &&
+                        !self.isStoppingPiP {
+                        if player.timeControlStatus == .paused && !self.resumePending { self.wantsPlaying = false }
                         if player.timeControlStatus == .playing { self.wantsPlaying = true }
                     }
-                    if player.timeControlStatus == .playing { self.activateSession() }
+                    self.surface?.updateAudioControls(playing: self.wantsPlaying)
+                    if player.timeControlStatus == .playing {
+                        self.activateSession()
+                        if self.handoffCompleted { self.endHandoffTask() }
+                    }
                 }
             }
             self.timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1, preferredTimescale: 600), queue: .main) { [weak self] time in
@@ -351,7 +567,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
                                                        pip: self.pipController?.isPictureInPictureActive ?? false)
                     if Date().timeIntervalSince(self.lastProgressLog) >= 15 {
                         self.lastProgressLog = Date()
-                        self.log("progress time=\(time.seconds) state=\(player.timeControlStatus.rawValue) sessionActive=\(self.session?.isActive ?? false)")
+                        self.log("progress time=\(time.seconds) state=\(player.timeControlStatus.rawValue) sessionActive=\(self.session?.isActive ?? false) pipActive=\(self.pipController?.isPictureInPictureActive ?? false) appState=\(UIApplication.shared.applicationState.rawValue)")
                     }
                 }
             }
@@ -361,16 +577,22 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
                     guard let self, self.generation == token, self.ownsPlayback else { return }
                     guard completed else {
                         self.finish(restorePlaying: self.wantsPlaying)
-                        self.fail("画中画定位失败，请重试。")
+                        if !automatic { self.fail("原生播放定位失败，请重试。") }
                         return
                     }
+                    self.handoffCompleted = true
                     if self.wantsPlaying { player.play() }
+                    self.surface?.updateAudioControls(playing: self.wantsPlaying)
                     self.activateSession()
-                    self.tryStartPiP(token: token)
+                    if self.mode == .pip {
+                        self.tryStartPiP(token: token)
+                    } else {
+                        self.log("audio handoff complete pipControllerPresent=\(self.pipController != nil) playingRequested=\(self.wantsPlaying) automatic=\(automatic)")
+                    }
                 }
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
-                guard let self, self.generation == token, self.ownsPlayback,
+                guard let self, self.generation == token, self.ownsPlayback, self.mode == .pip,
                       !(self.pipController?.isPictureInPictureActive ?? false) else { return }
                 self.log("PiP start timed out")
                 self.finish(restorePlaying: self.wantsPlaying)
@@ -380,13 +602,19 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
     }
 
     private func tryStartPiP(token: Int) {
-        guard generation == token, ownsPlayback, !didRequestPiP,
+        guard generation == token, ownsPlayback, mode == .pip, !didRequestPiP,
               UIApplication.shared.applicationState == .active,
               let pipController, pipController.isPictureInPicturePossible,
               surface?.playerLayer.isReadyForDisplay == true else { return }
         didRequestPiP = true
         log("starting native PiP")
         pipController.startPictureInPicture()
+    }
+
+    private func updateAudioPresentation(background: Bool) {
+        guard ownsPlayback, mode == .audio, let surface else { return }
+        surface.playerLayer.player = background ? nil : player
+        log("audio presentation attached=\(!background) appState=\(UIApplication.shared.applicationState.rawValue)")
     }
 
     private func installSession(_ state: [String: Any], player: AVPlayer) {
@@ -415,18 +643,31 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
                   event.positionTime.isFinite else { return .commandFailed }
             DispatchQueue.main.async {
                 guard self.ownsPlayback else { return }
+                self.cancelResumeRequest()
                 self.player?.seek(to: CMTime(seconds: max(0, event.positionTime), preferredTimescale: 600))
             }
             return .success
         }
         commandTargets.append((center.changePlaybackPositionCommand, seekTarget))
         let notifications = NotificationCenter.default
+        if mode == .audio {
+            notificationObservers.append(notifications.addObserver(forName: UIApplication.willResignActiveNotification,
+                                                                   object: nil, queue: .main) { [weak self] _ in
+                DispatchQueue.main.async { self?.updateAudioPresentation(background: true) }
+            })
+            notificationObservers.append(notifications.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                                                   object: nil, queue: .main) { [weak self] _ in
+                DispatchQueue.main.async { self?.updateAudioPresentation(background: false) }
+            })
+        }
         notificationObservers.append(notifications.addObserver(forName: AVAudioSession.routeChangeNotification,
                                                                object: nil, queue: .main) { [weak self] note in
             let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? NSNumber)?.uintValue ?? 0
             DispatchQueue.main.async {
                 guard let self, self.ownsPlayback,
                       reason == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue else { return }
+                self.cancelResumeRequest()
+                self.resumeAfterInterruption = false
                 self.wantsPlaying = false
                 self.player?.pause()
                 self.log("paused after audio device disconnected")
@@ -440,6 +681,8 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
                 guard let self, self.ownsPlayback else { return }
                 if type == AVAudioSession.InterruptionType.began.rawValue {
                     self.resumeAfterInterruption = self.wantsPlaying
+                    self.cancelResumeRequest()
+                    self.wantsPlaying = false
                     self.player?.pause()
                 } else if self.resumeAfterInterruption &&
                     options & AVAudioSession.InterruptionOptions.shouldResume.rawValue != 0 {
@@ -463,25 +706,108 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
     private func command(_ action: String) {
         guard ownsPlayback, let player else { return }
         let play = action == "play" || (action == "toggle" && !wantsPlaying)
+        cancelResumeRequest()
+        resumeAfterInterruption = false
         wantsPlaying = play
-        if play { player.play() } else { player.pause() }
-        let token = generation
         let start = player.currentTime().seconds
         log("command \(action) targetPlaying=\(play) time=\(start)")
-        if play {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                guard let self, self.generation == token, self.ownsPlayback else { return }
-                let delta = player.currentTime().seconds - start
-                self.log("resume verified=\(delta > 0.1 && player.timeControlStatus == .playing) delta=\(delta) state=\(player.timeControlStatus.rawValue)")
+        surface?.updateAudioControls(playing: wantsPlaying)
+        guard play else {
+            player.pause()
+            return
+        }
+
+        // A remote command can arrive after iOS has suspended paused audio.
+        // Protect only this bounded request, never the whole paused interval.
+        resumePending = true
+        let token = generation
+        let request = resumeGeneration
+        resumeTask = UIApplication.shared.beginBackgroundTask(withName: "NativePlaybackResume") { [weak self] in
+            guard let self, self.resumeGeneration == request else { return }
+            self.log("resume task expired")
+            self.cancelResumeRequest()
+        }
+        activateAudioForResume()
+        activateSession()
+        startRequestedPlayback(player)
+        logResumeState(player, phase: "requested")
+        checkResume(player, start: start, token: token, request: request, attempt: 0)
+    }
+
+    private func cancelResumeRequest() {
+        resumeGeneration += 1
+        resumePending = false
+        guard resumeTask != .invalid else { return }
+        let task = resumeTask
+        resumeTask = .invalid
+        UIApplication.shared.endBackgroundTask(task)
+    }
+
+    private func activateAudioForResume() {
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+            audioActivated = true
+            log("resume audio activated appState=\(UIApplication.shared.applicationState.rawValue)")
+        } catch {
+            let error = error as NSError
+            log("resume audio activation failed domain=\(error.domain) code=\(error.code)")
+        }
+    }
+
+    private func startRequestedPlayback(_ player: AVPlayer) {
+        // Bypass the HLS stall prediction only when media is actually buffered.
+        // Keep AVPlayer's normal loading behavior when the buffer is empty.
+        if player.currentItem?.isPlaybackBufferEmpty == false {
+            player.playImmediately(atRate: 1)
+        } else {
+            player.play()
+        }
+    }
+
+    private func logResumeState(_ player: AVPlayer, phase: String) {
+        let item = player.currentItem
+        log("resume \(phase) state=\(player.timeControlStatus.rawValue) reason=\(player.reasonForWaitingToPlay?.rawValue ?? "none") itemStatus=\(item?.status.rawValue ?? -1) bufferEmpty=\(item?.isPlaybackBufferEmpty ?? true) likelyToKeepUp=\(item?.isPlaybackLikelyToKeepUp ?? false)")
+    }
+
+    private func checkResume(_ player: AVPlayer, start: Double, token: Int, request: Int, attempt: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.generation == token, self.resumeGeneration == request,
+                  self.ownsPlayback, self.wantsPlaying, self.player === player else { return }
+            let delta = player.currentTime().seconds - start
+            let verified = delta.isFinite && delta > 0.1 && player.timeControlStatus == .playing
+            self.log("resume verified=\(verified) delta=\(delta) state=\(player.timeControlStatus.rawValue) attempt=\(attempt)")
+            self.logResumeState(player, phase: "checked")
+            if NativeResumeRecovery.shouldRetry(wantsPlaying: self.wantsPlaying,
+                                                ready: player.currentItem?.status == .readyToPlay,
+                                                ended: self.hasReachedEnd(player),
+                                                delta: delta, attempt: attempt) {
+                self.log("resume retry within same play request")
+                self.activateAudioForResume()
+                self.startRequestedPlayback(player)
+                self.checkResume(player, start: start, token: token, request: request, attempt: attempt + 1)
+            } else {
+                self.cancelResumeRequest()
             }
         }
     }
 
+    private func hasReachedEnd(_ player: AVPlayer) -> Bool {
+        guard let item = player.currentItem else { return true }
+        let duration = item.duration.seconds
+        let time = player.currentTime().seconds
+        return duration.isFinite && duration > 0 && time.isFinite && time >= duration - 0.05
+    }
+
     private func finish(restorePlaying: Bool) {
+        cancelResumeRequest()
         generation += 1
         let id = videoID
-        let elapsed = player?.currentTime().seconds ?? 0
+        let elapsed = handoffCompleted ? player?.currentTime().seconds : handoffTime
+        let wasAutomatic = automaticHandoff
+        if wasAutomatic { automaticRetryAfter = Date().addingTimeInterval(15) }
+        endHandoffTask()
         ownsPlayback = false
+        handoffCompleted = false
         player?.pause()
         if let timeObserver, let player { player.removeTimeObserver(timeObserver) }
         timeObserver = nil
@@ -500,12 +826,23 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         surface?.playerLayer.player = nil
         surface?.removeFromSuperview()
         surface = nil
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        PlaybackAudioSession.shared.update(playing: false, pip: false)
-        if elapsed.isFinite {
-            webView?.evaluateJavaScript("window.__rayRestoreAfterNativePiP?.(\(quote(id)), \(max(0,elapsed)), \(restorePlaying ? "true" : "false"))")
+        if audioActivated {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         }
-        log("returned to WebKit time=\(elapsed) playing=\(restorePlaying)")
+        audioActivated = false
+        PlaybackAudioSession.shared.update(playing: false, pip: false)
+        let timeArgument = elapsed?.isFinite == true ? String(max(0, elapsed!)) :
+            "(window.__rayNativePiPVideo?.currentTime || 0)"
+        let script = "window.__rayRestoreAfterNativePiP?.(\(quote(id)), \(timeArgument), \(restorePlaying ? "true" : "false"))"
+        if wasAutomatic && UIApplication.shared.applicationState != .active {
+            deferredRestoreScript = script
+            log("AUTO_HANDOFF restoration deferred until foreground")
+        } else {
+            webView?.evaluateJavaScript(script)
+        }
+        automaticHandoff = false
+        handoffTime = nil
+        log("returned to WebKit time=\(elapsed ?? -1) playing=\(restorePlaying)")
     }
 
     private func fail(_ message: String) {
@@ -518,7 +855,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
             .dropFirst().dropLast().description
     }
 
-    private func log(_ message: String) { PlaybackAudioSession.shared.log("NATIVE_PLAYBACK \(message)") }
+    private func log(_ message: String) { PlaybackAudioSession.shared.log("NATIVE_PLAYBACK mode=\(mode.rawValue) \(message)") }
 
     nonisolated func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         let controllerID = ObjectIdentifier(pictureInPictureController)
@@ -677,6 +1014,10 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         return true
     }
 
+    func applicationWillResignActive(_ application: UIApplication) {
+        (window?.rootViewController as? ViewController)?.applicationWillResignActive()
+    }
+
     func applicationDidEnterBackground(_ application: UIApplication) {
         PlaybackAudioSession.shared.log("did enter background")
     }
@@ -687,5 +1028,6 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func applicationDidBecomeActive(_ application: UIApplication) {
         PlaybackAudioSession.shared.log("did become active")
+        (window?.rootViewController as? ViewController)?.applicationBecameActive()
     }
 }
