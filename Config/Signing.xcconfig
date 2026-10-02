@@ -1,0 +1,6 @@
+// Shared defaults. Keep personal values in LocalSigning.xcconfig.
+CODE_SIGN_STYLE = Automatic
+DEVELOPMENT_TEAM =
+PRODUCT_BUNDLE_IDENTIFIER = com.ray.YouTubeIOSPoC
+
+#include? "LocalSigning.xcconfig"

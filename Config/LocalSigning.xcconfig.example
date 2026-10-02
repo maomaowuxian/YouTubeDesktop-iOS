@@ -1,0 +1,4 @@
+// Copy to LocalSigning.xcconfig and replace both placeholders.
+// This local file is ignored by Git. Keep the same IDs when updating an existing installation.
+DEVELOPMENT_TEAM = YOUR_TEAM_ID
+PRODUCT_BUNDLE_IDENTIFIER = com.yourname.YouTubeDesktop

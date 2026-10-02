@@ -5,3 +5,5 @@ xcuserdata/
 *.xccheckout
 *.xcscmblueprint
 .build/
+build/
+Config/LocalSigning.xcconfig
