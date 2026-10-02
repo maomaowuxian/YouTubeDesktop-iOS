@@ -5,10 +5,81 @@ import AVKit
 import MediaPlayer
 import WebKit
 
+/// YouTube carries audio identity on muxed variants, not an AVMediaSelectionGroup.
+enum NativeHLSAudioRouting {
+    struct Variant {
+        let url: URL
+        let audioID: String
+        let xtags: String
+        let height: Int
+        let bandwidth: Int
+    }
+
+    static func attributes(_ line: String) -> [String: String] {
+        let regex = try! NSRegularExpression(pattern: #"([A-Z0-9-]+)=("[^"]*"|[^,]*)"#)
+        let text = line as NSString
+        var result: [String: String] = [:]
+        for match in regex.matches(in: line, range: NSRange(location: 0, length: text.length)) {
+            let key = text.substring(with: match.range(at: 1))
+            var value = text.substring(with: match.range(at: 2))
+            if value.hasPrefix("\""), value.hasSuffix("\"") { value.removeFirst(); value.removeLast() }
+            result[key] = value
+        }
+        return result
+    }
+
+    static func variants(_ manifest: String, baseURL: URL) -> [Variant] {
+        var pending: [String: String]?
+        var result: [Variant] = []
+        for rawLine in manifest.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.hasPrefix("#EXT-X-STREAM-INF:") {
+                pending = attributes(line)
+            } else if !line.isEmpty, !line.hasPrefix("#"), let values = pending {
+                pending = nil
+                guard values["AUDIO"] == nil,
+                      let url = URL(string: line, relativeTo: baseURL)?.absoluteURL,
+                      url.scheme == "https", let host = url.host,
+                      host == "googlevideo.com" || host.hasSuffix(".googlevideo.com"),
+                      (url.path.hasPrefix("/api/manifest/hls_variant/") ||
+                       url.path.hasPrefix("/api/manifest/hls_playlist/")) else { continue }
+                let height = Int(values["RESOLUTION"]?.split(separator: "x").last ?? "") ?? 0
+                result.append(Variant(url: url,
+                    audioID: values["YT-EXT-AUDIO-CONTENT-ID"] ?? "und",
+                    xtags: values["YT-EXT-XTAGS"] ?? "",
+                    height: height, bandwidth: Int(values["BANDWIDTH"] ?? "") ?? 0))
+            }
+        }
+        return result
+    }
+
+    static func choose(_ variants: [Variant], audioID: String, xtags: String, preferredHeight: Int) -> Variant? {
+        // "und" with no xtags is YouTube's untagged/default stream.
+        // Never let AVPlayer compare it with differently tagged dubs.
+        let matches = variants.filter {
+            if !xtags.isEmpty {
+                return $0.xtags == xtags && (audioID.isEmpty || audioID == "und" || $0.audioID == audioID)
+            }
+            if audioID == "und" { return $0.audioID == "und" && $0.xtags.isEmpty }
+            return !audioID.isEmpty && $0.audioID == audioID
+        }
+        let limit = preferredHeight > 0 ? preferredHeight : 1080
+        let fitting = matches.filter { $0.height <= limit }
+        let pool = fitting.isEmpty ? matches.filter { $0.height == matches.map(\.height).min() } : fitting
+        return pool.max {
+            $0.height == $1.height ? $0.bandwidth < $1.bandwidth : $0.height < $1.height
+        }
+    }
+}
+
 /// Verifies the actual webpage media URL in a paused player before PiP handoff.
 @MainActor
 final class NativeAudioSourceProbe {
-    var onCompatible: ((String, AVURLAsset, AVPlayer?) -> Void)?
+    var onCompatible: ((String, URL, String, AVURLAsset, AVPlayer?) -> Void)?
+    private var audioKey = ""
+    private var audioID = ""
+    private var audioXtags = ""
+    private var preferredHeight = 1080
     private var videoID = ""
     private var pip = false
     private var expectedDuration = 0.0
@@ -34,7 +105,13 @@ final class NativeAudioSourceProbe {
                 url.path.hasPrefix("/api/manifest/hls_playlist/") ||
                 url.path == "/api/manifest/hls_variant" ||
                 url.path.hasPrefix("/api/manifest/hls_variant/") else { return }
-        if id != videoID { reset(videoID: id) }
+        guard let audio = message["audioTrack"] as? [String: Any],
+              let key = audio["key"] as? String, !key.isEmpty,
+              audio["known"] as? Bool == true else { return }
+        if id != videoID || key != audioKey { reset(videoID: id, audioKey: key) }
+        audioID = audio["id"] as? String ?? ""
+        audioXtags = audio["xtags"] as? String ?? ""
+        preferredHeight = message["videoHeight"] as? Int ?? 1080
         guard !candidates.contains(url), candidates.count < 4 else { return }
         candidates.append(url)
         let mime = URLComponents(url: url, resolvingAgainstBaseURL: false)?
@@ -45,14 +122,19 @@ final class NativeAudioSourceProbe {
 
     func update(_ media: [String: Any]) {
         let id = media["videoID"] as? String ?? ""
-        if id != videoID { reset(videoID: id) }
+        let audio = media["audioTrack"] as? [String: Any] ?? [:]
+        let key = audio["key"] as? String ?? ""
+        if id != videoID || key != audioKey { reset(videoID: id, audioKey: key) }
+        audioID = audio["id"] as? String ?? ""
+        audioXtags = audio["xtags"] as? String ?? ""
+        preferredHeight = media["videoHeight"] as? Int ?? 1080
         expectedDuration = (media["duration"] as? Double) ?? 0
         let foregroundProbe = !id.isEmpty && UIApplication.shared.applicationState == .active
         if foregroundProbe && expectedDuration <= 0 {
             expectedDuration = (media["sourceDuration"] as? Double) ?? 0
         }
         let active = ((media["pip"] as? Bool ?? false) || foregroundProbe) &&
-            !(media["ad"] as? Bool ?? false)
+            !(media["ad"] as? Bool ?? false) && (audio["known"] as? Bool ?? false)
         if pip && !active { cancel(retryInterrupted: true) }
         pip = active
         guard active else { return }
@@ -62,9 +144,10 @@ final class NativeAudioSourceProbe {
         startIfPossible()
     }
 
-    private func reset(videoID: String) {
+    private func reset(videoID: String, audioKey: String) {
         cancel()
         self.videoID = videoID
+        self.audioKey = audioKey
         pip = false
         expectedDuration = 0
         candidates.removeAll()
@@ -96,14 +179,14 @@ final class NativeAudioSourceProbe {
         generation += 1
         let currentGeneration = generation
         let expected = expectedDuration
-        // Same device/IP as WebKit. Do not log signed media URLs.
-        let source = AVURLAsset(url: url, options: [
-            "AVURLAssetHTTPHeaderFieldsKey": [
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
-                "Referer": "https://www.youtube.com/"
-            ]
-        ])
-        asset = source
+        let selectedAudioID = audioID
+        let selectedXtags = audioXtags
+        let selectedAudioKey = audioKey
+        let selectedHeight = preferredHeight
+        let headers = [
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+            "Referer": "https://www.youtube.com/"
+        ]
         PlaybackAudioSession.shared.log("NATIVE_SOURCE loading stream metadata expectedDuration=\(expected)")
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
             guard let self, self.generation == currentGeneration, self.task != nil else { return }
@@ -125,10 +208,47 @@ final class NativeAudioSourceProbe {
         #endif
         task = Task { [weak self] in
             do {
+                var playbackURL = url
+                if url.path.hasPrefix("/api/manifest/hls_") {
+                    var request = URLRequest(url: url)
+                    request.timeoutInterval = 8
+                    headers.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+                    let network = URLSession(configuration: .ephemeral)
+                    defer { network.finishTasksAndInvalidate() }
+                    let (data, response) = try await network.data(for: request)
+                    guard (response as? HTTPURLResponse)?.statusCode == 200,
+                          data.count < 2_000_000,
+                          let manifest = String(data: data, encoding: .utf8),
+                          manifest.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#EXTM3U"),
+                          let self, !Task.isCancelled, self.generation == currentGeneration else {
+                        throw NSError(domain: "NativeAudioRouting", code: 1)
+                    }
+                    if manifest.contains("#EXT-X-STREAM-INF:") {
+                        let variants = NativeHLSAudioRouting.variants(manifest, baseURL: response.url ?? url)
+                        guard let selected = NativeHLSAudioRouting.choose(variants, audioID: selectedAudioID,
+                            xtags: selectedXtags, preferredHeight: selectedHeight) else {
+                            let identities = Set(variants.map(\.audioID)).sorted().joined(separator: ",")
+                            PlaybackAudioSession.shared.log("AUDIO_TRACK no match web=\(selectedAudioID) choices=\(variants.count) identities=\(identities)")
+                            throw NSError(domain: "NativeAudioRouting", code: 2)
+                        }
+                        playbackURL = selected.url
+                        PlaybackAudioSession.shared.log("AUDIO_TRACK matched web=\(selectedAudioID) variant=\(selected.audioID) height=\(selected.height) choices=\(variants.count)")
+                    } else {
+                        // A media playlist is already the exact stream WebKit uses.
+                        guard manifest.contains("#EXTINF:") else {
+                            throw NSError(domain: "NativeAudioRouting", code: 3)
+                        }
+                        PlaybackAudioSession.shared.log("AUDIO_TRACK exact webpage media playlist web=\(selectedAudioID)")
+                    }
+                }
+                guard let self, !Task.isCancelled, self.generation == currentGeneration else { return }
+                // Use only URLs returned by the signed playlist. Never rewrite signatures.
+                let source = AVURLAsset(url: playbackURL, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+                self.asset = source
                 let playable = try await source.load(.isPlayable)
                 let duration = try await source.load(.duration).seconds
                 let tracks = try await source.loadTracks(withMediaType: .audio)
-                guard let self, !Task.isCancelled, self.generation == currentGeneration else { return }
+                guard !Task.isCancelled, self.generation == currentGeneration else { return }
                 var verifiedPlayer: AVPlayer?
                 var audioTracks = tracks.count
                 var videoTracks = try await source.loadTracks(withMediaType: .video).count
@@ -138,6 +258,7 @@ final class NativeAudioSourceProbe {
                     // a ready AVURLAsset may legitimately expose no audio tracks.
                     let item = AVPlayerItem(asset: source)
                     let player = AVPlayer(playerItem: item)
+                    player.appliesMediaSelectionCriteriaAutomatically = false
                     self.probePlayer = player
                     // Transfer this verified, paused player on success;
                     // avoid repeating the HLS loading delay with another item.
@@ -165,13 +286,14 @@ final class NativeAudioSourceProbe {
                 guard !Task.isCancelled, self.generation == currentGeneration else { return }
                 let compatible = playable && audioTracks > 0 && videoTracks > 0 && duration.isFinite &&
                     abs(duration - expected) < 3
+                guard !Task.isCancelled, self.generation == currentGeneration else { return }
                 self.foundCompatibleSource = compatible
                 PlaybackAudioSession.shared.log("NATIVE_SOURCE metadata compatible=\(compatible) playable=\(playable) duration=\(duration) expected=\(expected) audioTracks=\(audioTracks)")
                 self.task = nil
                 self.asset = nil
                 self.activeCandidate = nil
                 if compatible {
-                    self.onCompatible?(self.videoID, source, verifiedPlayer)
+                    self.onCompatible?(self.videoID, url, selectedAudioKey, source, verifiedPlayer)
                 } else {
                     verifiedPlayer?.replaceCurrentItem(with: nil)
                 }
@@ -258,6 +380,8 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
     private var automaticRetryAfter = Date.distantPast
     private var videoID = ""
     private var asset: AVURLAsset?
+    private var webpageSourceURL: URL?
+    private var preparedAudioKey = ""
     private var player: AVPlayer?
     private var surface: NativePlayerSurface?
     private var pipController: AVPictureInPictureController?
@@ -282,7 +406,28 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
     private var resumePending = false
     private var resumeTask: UIBackgroundTaskIdentifier = .invalid
 
-    func prepare(videoID: String, asset: AVURLAsset, verifiedPlayer: AVPlayer? = nil) {
+    func updateAudioState(_ state: [String: Any]) {
+        guard !ownsPlayback, state["videoID"] as? String == videoID,
+              let audio = state["audioTrack"] as? [String: Any],
+              audio["key"] as? String != preparedAudioKey else { return }
+        preparationGeneration += 1
+        itemObservation?.invalidate()
+        itemObservation = nil
+        player?.replaceCurrentItem(with: nil)
+        player = nil
+        asset = nil
+        webpageSourceURL = nil
+        preparedAudioKey = ""
+        log("AUDIO_TRACK prepared source invalidated after webpage selection changed")
+    }
+
+    private func matchesPreparedAudio(_ state: [String: Any]) -> Bool {
+        guard let audio = state["audioTrack"] as? [String: Any] else { return false }
+        return audio["known"] as? Bool == true && !preparedAudioKey.isEmpty &&
+            audio["key"] as? String == preparedAudioKey
+    }
+
+    func prepare(videoID: String, webpageSourceURL: URL, audioKey: String, asset: AVURLAsset, verifiedPlayer: AVPlayer? = nil) {
         guard !ownsPlayback else { return }
         if self.videoID == videoID, self.asset === asset, player != nil { return }
         preparationGeneration += 1
@@ -291,8 +436,11 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         player?.replaceCurrentItem(with: nil)
         self.videoID = videoID
         self.asset = asset
+        self.webpageSourceURL = webpageSourceURL
+        self.preparedAudioKey = audioKey
         let player = verifiedPlayer ?? AVPlayer(playerItem: AVPlayerItem(asset: asset))
         guard let item = player.currentItem else { return }
+        player.appliesMediaSelectionCriteriaAutomatically = false
         self.player = player
         itemObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             DispatchQueue.main.async {
@@ -320,7 +468,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         guard !ownsPlayback, UIApplication.shared.applicationState == .active,
               let id = state["videoID"] as? String, !id.isEmpty,
               !(state["ad"] as? Bool ?? false) else { return }
-        if id == videoID, player?.currentItem?.status == .readyToPlay {
+        if id == videoID, matchesPreparedAudio(state), player?.currentItem?.status == .readyToPlay {
             begin(state)
             return
         }
@@ -337,7 +485,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
     func primeAudioPosition(_ state: [String: Any]) {
         guard !ownsPlayback, pendingRequest == nil,
               UIApplication.shared.applicationState == .active,
-              state["videoID"] as? String == videoID,
+              state["videoID"] as? String == videoID, matchesPreparedAudio(state),
               !(state["ad"] as? Bool ?? true), !(state["paused"] as? Bool ?? true),
               let time = state["currentTime"] as? Double, time.isFinite, time >= 0,
               let player, player.currentItem?.status == .readyToPlay,
@@ -364,7 +512,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
             log("AUTO_HANDOFF skipped cached content not playing")
             return
         }
-        guard player?.currentItem?.status == .readyToPlay else {
+        guard matchesPreparedAudio(state), player?.currentItem?.status == .readyToPlay else {
             log("AUTO_HANDOFF skipped native source not ready")
             return
         }
@@ -417,6 +565,8 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         player?.replaceCurrentItem(with: nil)
         player = nil
         asset = nil
+        webpageSourceURL = nil
+        preparedAudioKey = ""
         videoID = ""
         generation += 1
     }
@@ -424,7 +574,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
     private func begin(_ state: [String: Any], automatic: Bool = false) {
         let requestedMode: Mode = automatic || state["playbackMode"] as? String == "audio" ? .audio : .pip
         guard !ownsPlayback, let webView, let player,
-              state["videoID"] as? String == videoID,
+              state["videoID"] as? String == videoID, matchesPreparedAudio(state),
               player.currentItem?.status == .readyToPlay,
               (requestedMode == .audio || AVPictureInPictureController.isPictureInPictureSupported()),
               (UIApplication.shared.applicationState == .active ||
@@ -465,11 +615,13 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         }
         // For automatic handoff, the page must still be playing this exact source.
         // The URL is passed only in memory, never to diagnostics.
-        let sourceArgument = automatic ? ", \(quote(asset?.url.absoluteString ?? ""))" : ""
-        webView.evaluateJavaScript("window.__rayPauseForNativePiP?.(\(quotedID)\(sourceArgument))") { [weak self] result, error in
+        let sourceArgument = automatic ? quote(webpageSourceURL?.absoluteString ?? "") : quote("")
+        let audioArgument = quote(preparedAudioKey)
+        webView.evaluateJavaScript("window.__rayPauseForNativePiP?.(\(quotedID), \(sourceArgument), \(audioArgument))") { [weak self] result, error in
             guard let self, self.generation == token, self.ownsPlayback else { return }
             guard error == nil, let snapshot = result as? [String: Any],
                   snapshot["videoID"] as? String == id,
+                  snapshot["audioKey"] as? String == self.preparedAudioKey,
                   let time = snapshot["currentTime"] as? Double, time.isFinite,
                   snapshot["paused"] as? Bool == true,
                   (!automatic || snapshot["wasPlaying"] as? Bool == true),
@@ -479,6 +631,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
                 if !automatic { self.fail("播放状态已改变，请重新开始。") }
                 return
             }
+            self.log("AUDIO_TRACK atomic selection verified")
             self.wantsPlaying = snapshot["wasPlaying"] as? Bool ?? true
             self.handoffTime = time
             if automatic && self.automaticCancellationRequested {
