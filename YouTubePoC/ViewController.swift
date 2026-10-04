@@ -182,6 +182,201 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             return {known, id, xtags, defaultID:defaultIDs.join(','),
               key:known ? JSON.stringify([id, xtags, defaultIDs]) : ''};
           };
+          const readPlaybackRate = (video) => {
+            const rate = Number(video?.playbackRate);
+            return Number.isFinite(rate) && rate >= 0.25 && rate <= 4 ? rate : 1;
+          };
+          const captionTrackID = (track, index) => String(track.vssId ||
+            [track.languageCode || 'und', track.kind || '', index].join(':')).slice(0,160);
+          const captionTracksForVideo = (videoID) => {
+            try {
+              const response = document.getElementById('movie_player')?.getPlayerResponse?.();
+              if (response?.videoDetails?.videoId !== videoID) return [];
+              return (response.captions?.playerCaptionsTracklistRenderer?.captionTracks || []).slice(0,50);
+            } catch (_) { return []; }
+          };
+          const readCaptionSettings = (videoID) => {
+            const tracks = captionTracksForVideo(videoID);
+            let selected = null;
+            try { selected = document.getElementById('movie_player')?.getOption?.('captions','track'); } catch (_) {}
+            const button = document.querySelector('.ytp-subtitles-button');
+            const enabled = button ? button.getAttribute('aria-pressed') === 'true' : !!selected?.languageCode;
+            let index = tracks.findIndex(t => t.vssId && t.vssId === selected?.vssId);
+            if (index < 0) index = tracks.findIndex(t => t.languageCode === selected?.languageCode &&
+              (t.kind || '') === (selected?.kind || ''));
+            if (index < 0 && enabled && tracks.length) index = 0;
+            return {enabled:enabled && index >= 0, selectedID:index >= 0 ? captionTrackID(tracks[index],index) : '',
+              tracks:tracks.map((t,i) => ({id:captionTrackID(t,i), languageCode:String(t.languageCode || '').slice(0,40),
+                name:String(t.name?.simpleText || t.name?.runs?.map(r => r.text).join('') || t.languageCode || '字幕').slice(0,100)}))};
+          };
+          const parseCaptionBody = (body) => {
+            const rows = [];
+            if (body.trimStart().startsWith('{')) {
+              const data = JSON.parse(body);
+              for (const event of data.events || []) {
+                if (!Array.isArray(event.segs)) continue;
+                const start = Number(event.tStartMs) / 1000;
+                const end = start + Number(event.dDurationMs) / 1000;
+                rows.push({start,end,text:event.segs.map(s => s.utf8 || '').join('').trim()});
+              }
+            } else {
+              const xml = new DOMParser().parseFromString(body,'application/xml');
+              if (xml.querySelector('parsererror')) return [];
+              for (const node of xml.querySelectorAll('text, body > p')) {
+                const modern = node.hasAttribute('t');
+                const start = Number(node.getAttribute(modern ? 't' : 'start')) / (modern ? 1000 : 1);
+                const duration = Number(node.getAttribute(modern ? 'd' : 'dur')) / (modern ? 1000 : 1);
+                rows.push({start,end:start+duration,text:String(node.textContent || '').trim()});
+              }
+            }
+            return rows.filter(c => Number.isFinite(c.start) && Number.isFinite(c.end) &&
+              c.start >= 0 && c.end > c.start && c.text).slice(0,12000)
+              .map(c => ({...c,text:c.text.slice(0,800)}));
+          };
+          const captionCuesCache = new Map();
+          const timedTextURL = (raw) => {
+            try {
+              const url = new URL(raw,location.href);
+              return url.protocol === 'https:' && !url.username && !url.password &&
+                (url.hostname === 'youtube.com' || url.hostname.endsWith('.youtube.com')) &&
+                url.pathname === '/api/timedtext' ? url : null;
+            } catch (_) { return null; }
+          };
+          const rememberCaptionResponse = (raw,body,requestVideoID) => {
+            const url = timedTextURL(raw);
+            const currentID = new URL(location.href).searchParams.get('v');
+            if (!url || !currentID || currentID !== requestVideoID ||
+                url.searchParams.get('v') !== currentID || url.searchParams.has('tlang') ||
+                typeof body !== 'string' || body.length > 2*1024*1024) return;
+            const tracks = captionTracksForVideo(currentID);
+            const index = tracks.findIndex(t => t.languageCode === url.searchParams.get('lang') &&
+              (t.kind || '') === (url.searchParams.get('kind') || ''));
+            if (index < 0) return;
+            try {
+              const cues = parseCaptionBody(body);
+              if (!cues.length) return;
+              const key = currentID + ':' + captionTrackID(tracks[index],index);
+              if (captionCuesCache.size >= 4 && !captionCuesCache.has(key))
+                captionCuesCache.delete(captionCuesCache.keys().next().value);
+              captionCuesCache.set(key,cues);
+            } catch (_) {}
+          };
+          // Observe the player's normal request after it applies its own session
+          // parameters. Originals still receive the unmodified response.
+          if (typeof window.fetch === 'function') {
+            const originalFetch = window.fetch;
+            window.fetch = function(input,...args) {
+              const raw = typeof input === 'string' || input instanceof URL ? String(input) : input?.url;
+              const requestID = new URL(location.href).searchParams.get('v');
+              const result = originalFetch.call(this,input,...args);
+              if (timedTextURL(raw)) result.then(response => {
+                if (!response.ok) return;
+                response.clone().text().then(body => rememberCaptionResponse(raw,body,requestID)).catch(() => {});
+              }).catch(() => {});
+              return result;
+            };
+          }
+          if (typeof XMLHttpRequest !== 'undefined') {
+            const originalOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method,raw,...args) {
+              const result = originalOpen.call(this,method,raw,...args);
+              if (timedTextURL(raw)) {
+                const requestID = new URL(location.href).searchParams.get('v');
+                const receive = () => {
+                  this.removeEventListener('load',receive);
+                  this.removeEventListener('loadend',cleanup);
+                  try {
+                    if (this.status < 200 || this.status >= 300) return;
+                    const body = this.responseType === 'json' ? JSON.stringify(this.response) : this.responseText;
+                    rememberCaptionResponse(raw,body,requestID);
+                  } catch (_) {}
+                };
+                const cleanup = () => {
+                  this.removeEventListener('load',receive);
+                  this.removeEventListener('loadend',cleanup);
+                };
+                this.addEventListener('load',receive);
+                this.addEventListener('loadend',cleanup);
+              }
+              return result;
+            };
+          }
+          window.__rayLoadNativeCaptions = async (videoID, trackID) => {
+            const matches = () => window.__rayNativePiPOwner === videoID &&
+              new URL(location.href).searchParams.get('v') === videoID;
+            if (!matches()) return null;
+            const tracks = captionTracksForVideo(videoID);
+            const index = tracks.findIndex((t,i) => captionTrackID(t,i) === trackID);
+            if (index < 0) return null;
+            const cached = () => captionCuesCache.get(videoID + ':' + trackID);
+            const payload = cues => ({videoID,trackID,cues});
+            if (cached()) return payload(cached());
+            // Ask the paused webpage player to load this real track through its
+            // normal caption module. Capture its response, without rebuilding URLs.
+            const player = document.getElementById('movie_player');
+            if (typeof player?.loadModule === 'function' && typeof player?.setOption === 'function') {
+              try {
+                player.loadModule('captions');
+                player.setOption('captions','track',tracks[index]);
+                for (let attempt=0; attempt<80 && matches(); attempt++) {
+                  if (cached()) return payload(cached());
+                  await new Promise(resolve => setTimeout(resolve,100));
+                  if (attempt === 3 || attempt === 9) player.setOption('captions','track',tracks[index]);
+                }
+              } catch (_) {}
+            }
+            if (!matches()) return null;
+            const url = timedTextURL(tracks[index].baseUrl);
+            if (!url) return null;
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(),15000);
+            try {
+              const response = await fetch(url.toString(),{credentials:'same-origin',signal:controller.signal});
+              if (!response.ok || !matches()) return null;
+              const body = await response.text();
+              if (!matches() || body.length > 2*1024*1024) return null;
+              return payload(parseCaptionBody(body));
+            } catch (_) { return null; } finally { clearTimeout(timeout); }
+          };
+          const readWebPlaybackSettings = () => {
+            const videoID = new URL(location.href).searchParams.get('v') || '';
+            const video = document.querySelector('.html5-video-player video');
+            const player = document.querySelector('.html5-video-player');
+            if (!videoID || !video || window.__rayNativePiPOwner ||
+                player?.classList.contains('ad-showing')) return null;
+            return {videoID, playbackRate:readPlaybackRate(video), captions:readCaptionSettings(videoID)};
+          };
+          const applyWebPlaybackSetting = (videoID, rate = null, captionID = null) => {
+            const settings = readWebPlaybackSettings();
+            if (!settings || settings.videoID !== videoID) return false;
+            const video = document.querySelector('.html5-video-player video');
+            const player = document.getElementById('movie_player');
+            if (rate !== null) {
+              if (!Number.isFinite(rate) || rate < 0.25 || rate > 2) return false;
+              try { player?.setPlaybackRate?.(rate); } catch (_) {}
+              video.playbackRate = rate;
+            }
+            if (captionID !== null) {
+              const tracks = captionTracksForVideo(videoID);
+              const index = tracks.findIndex((t,i) => captionTrackID(t,i) === captionID);
+              if (captionID && index < 0) return false;
+              try {
+                if (captionID) player?.loadModule?.('captions');
+                player?.setOption?.('captions','track',captionID ? tracks[index] : {});
+              } catch (_) { return false; }
+            }
+            return true;
+          };
+          window.__raySetNativePlaybackRate = (videoID, rate) => {
+            const video = window.__rayNativePiPVideo;
+            if (window.__rayNativePiPOwner !== videoID ||
+                new URL(location.href).searchParams.get('v') !== videoID ||
+                document.querySelector('.html5-video-player video') !== video ||
+                !Number.isFinite(rate) || rate < 0.25 || rate > 4) return false;
+            try { document.getElementById('movie_player')?.setPlaybackRate?.(rate); } catch (_) {}
+            video.playbackRate = rate;
+            return true;
+          };
           window.__rayNativePiPOwner = '';
           window.__rayNativePiPVideo = null;
           window.__rayNativePiPMetadata = null;
@@ -204,7 +399,10 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             }
             const audio = readAudioTrack();
             if (!audio.known || !expectedAudioKey || audio.key !== expectedAudioKey) return null;
+            window.__rayHideWebSettings?.();
             const wasPlaying = !video.paused;
+            const playbackRate = readPlaybackRate(video);
+            const captions = readCaptionSettings(videoID);
             window.__rayNativePiPOwner = videoID;
             window.__rayNativePiPVideo = video;
             window.__rayNativePiPMetadata = navigator.mediaSession?.metadata || null;
@@ -213,9 +411,9 @@ final class ViewController: UIViewController, WKNavigationDelegate {
               navigator.mediaSession.playbackState = 'none';
               navigator.mediaSession.metadata = null;
             } catch (_) {}
-            return {videoID, audioKey:audio.key, currentTime:video.currentTime, wasPlaying, paused:video.paused};
+            return {videoID, audioKey:audio.key, currentTime:video.currentTime, playbackRate, captions, wasPlaying, paused:video.paused};
           };
-          window.__rayRestoreAfterNativePiP = (videoID, time, play) => {
+          window.__rayRestoreAfterNativePiP = (videoID, time, play, rate, captionID = null) => {
             window.__rayResetPiPButton();
             if (window.__rayNativePiPOwner !== videoID) return false;
             const video = window.__rayNativePiPVideo;
@@ -227,7 +425,26 @@ final class ViewController: UIViewController, WKNavigationDelegate {
                 document.querySelector('.html5-video-player video') !== video) return false;
             video.pause();
             try { video.currentTime = Math.max(0, Math.min(time, Number.isFinite(video.duration) ? video.duration : time)); } catch (_) {}
+            const player = document.getElementById('movie_player');
+            const playbackRate = Number.isFinite(rate) && rate >= 0.25 && rate <= 4 ? rate : readPlaybackRate(video);
+            try { player?.setPlaybackRate?.(playbackRate); } catch (_) {}
+            video.playbackRate = playbackRate;
+            if (captionID !== null) {
+              try {
+                if (!captionID) {
+                  player?.setOption?.('captions','track',{});
+                } else {
+                  const tracks = captionTracksForVideo(videoID);
+                  const index = tracks.findIndex((t,i) => captionTrackID(t,i) === captionID);
+                  if (index >= 0) {
+                    player?.loadModule?.('captions');
+                    player?.setOption?.('captions','track',tracks[index]);
+                  }
+                }
+              } catch (_) {}
+            }
             try { navigator.mediaSession.metadata = metadata; } catch (_) {}
+            window.__rayRefreshWebSettings?.();
             if (play) video.play()?.catch?.(() => post({kind:'nativeRestoreFailed'}));
             return true;
           };
@@ -311,6 +528,7 @@ final class ViewController: UIViewController, WKNavigationDelegate {
               paused:video ? !!video.paused : true,
               ended:video ? !!video.ended : false,
               currentTime:video ? video.currentTime : 0,
+              playbackRate:readPlaybackRate(video),
               readyState:video ? video.readyState : 0,
               muted:video ? !!video.muted : false,
               volume:video ? video.volume : 0,
@@ -670,6 +888,101 @@ final class ViewController: UIViewController, WKNavigationDelegate {
           };
 
           let refreshPending = false;
+          let webSettingsHost = null, webSettingsPanel = null;
+          const closeWebSettings = () => {
+            webSettingsPanel?.remove();
+            webSettingsPanel = null;
+            webSettingsHost?.setAttribute('aria-expanded','false');
+          };
+          const ensureWebPlaybackSettings = () => {
+            const player = document.querySelector('.html5-video-player');
+            const settings = readWebPlaybackSettings();
+            if (!player || !settings) {
+              if (webSettingsHost) webSettingsHost.style.display = 'none';
+              closeWebSettings();
+              return;
+            }
+            if (!webSettingsHost || webSettingsHost.parentElement !== player) {
+              webSettingsHost?.remove();
+              closeWebSettings();
+              const button = document.createElement('button');
+              button.id = 'ray-web-playback-settings';
+              button.type = 'button';
+              button.setAttribute('aria-label','播放设置，倍速和字幕');
+              button.setAttribute('aria-expanded','false');
+              button.style.cssText = 'position:absolute;right:8px;bottom:48px;z-index:2147483000;min-width:76px;min-height:44px;padding:8px 12px;border:0;border-radius:8px;background:rgba(0,0,0,.75);color:white;font:16px -apple-system,sans-serif;cursor:pointer;pointer-events:auto;';
+              for (const type of ['pointerdown','pointerup','touchstart','touchend'])
+                button.addEventListener(type,event => event.stopPropagation());
+              button.addEventListener('click',event => {
+                event.preventDefault();event.stopPropagation();
+                if (webSettingsPanel) { closeWebSettings(); return; }
+                const current = readWebPlaybackSettings();
+                if (!current) return;
+                const panel = document.createElement('div');
+                panel.id = 'ray-web-playback-settings-panel';
+                panel.setAttribute('role','dialog');
+                panel.setAttribute('aria-label','播放设置');
+                const rect = button.getBoundingClientRect();
+                panel.style.cssText = 'position:fixed;z-index:2147483647;width:210px;box-sizing:border-box;padding:12px;border-radius:12px;background:#252525;color:white;font:16px -apple-system,sans-serif;box-shadow:0 4px 20px #0008;';
+                panel.style.right = Math.max(8,innerWidth-rect.right)+'px';
+                panel.style.top = Math.max(8,Math.min(rect.top-174,innerHeight-190))+'px';
+                panel.addEventListener('click',e => e.stopPropagation());
+                const addSelect = (title,options,value,onChange,disabled=false) => {
+                  const label = document.createElement('label');
+                  label.style.cssText = 'display:block;margin:0 0 8px;font-size:14px;color:white;';
+                  label.appendChild(document.createTextNode(title));
+                  const select = document.createElement('select');
+                  select.setAttribute('aria-label',title);
+                  select.style.cssText = 'display:block;box-sizing:border-box;width:100%;height:44px;margin-top:4px;padding:8px;border:1px solid #777;border-radius:6px;background:#333;color:white;font:16px -apple-system,sans-serif;';
+                  for (const [key,text] of options) {
+                    const option = document.createElement('option');
+                    option.value=key;option.textContent=text;select.appendChild(option);
+                  }
+                  select.value=value;select.disabled=disabled;
+                  select.addEventListener('change',() => {
+                    if (!applyWebPlaybackSetting(current.videoID,...onChange(select.value))) {
+                      closeWebSettings();return;
+                    }
+                    reportMediaState('settings');
+                    ensureWebPlaybackSettings();
+                  });
+                  label.appendChild(select);panel.appendChild(label);
+                };
+                const rates=[0.25,0.5,0.75,1,1.25,1.5,1.75,2];
+                if (!rates.includes(current.playbackRate) && current.playbackRate<=2)
+                  rates.push(current.playbackRate);
+                addSelect('播放速度',rates.sort((a,b)=>a-b).map(r=>[String(r),r+'×']),
+                  String(current.playbackRate),value=>[Number(value),null]);
+                const tracks=current.captions.tracks;
+                addSelect('字幕',tracks.length ? [['','关闭'],...tracks.map(t=>[t.id,t.name])] : [['','此视频暂无可用字幕']],
+                  current.captions.enabled ? current.captions.selectedID : '',value=>[null,value],!tracks.length);
+                document.body.appendChild(panel);
+                webSettingsPanel=panel;button.setAttribute('aria-expanded','true');
+              });
+              player.appendChild(button);
+              webSettingsHost=button;
+            }
+            const text='⚙ '+settings.playbackRate+'×';
+            if (webSettingsHost.textContent!==text) webSettingsHost.textContent=text;
+            webSettingsHost.style.display='';
+          };
+          window.__rayHideWebSettings = () => {
+            closeWebSettings();
+            if (webSettingsHost) webSettingsHost.style.display='none';
+          };
+          window.__rayRefreshWebSettings = ensureWebPlaybackSettings;
+          document.addEventListener('click',event => {
+            if (!webSettingsHost?.contains(event.target) && !webSettingsPanel?.contains(event.target))
+              closeWebSettings();
+          },true);
+          window.addEventListener('scroll',closeWebSettings,true);
+          window.addEventListener('resize',closeWebSettings);
+          window.__rayWebSettingsProbe = () => ({
+            visible:!!webSettingsHost?.isConnected && webSettingsHost.style.display !== 'none',
+            panel:!!webSettingsPanel, tracks:readWebPlaybackSettings()?.captions.tracks.length ?? -1,
+            rate:readWebPlaybackSettings()?.playbackRate ?? 0
+          });
+
           const refresh = () => {
             ensurePhoneLayoutFix();
             ensureChannelLayoutFix();
@@ -678,6 +991,7 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             ensurePiPButton();
             ensureAudioButton();
             ensureFullscreenOverride();
+            ensureWebPlaybackSettings();
           };
 
           const scheduleRefresh = () => {
@@ -704,8 +1018,11 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             setInterval(scanForSkippableAd, 350);
             setInterval(scanPlayerSources, 2000);
             document.addEventListener('yt-navigate-start', () => {
+              closeWebSettings();
+              if (webSettingsHost) webSettingsHost.style.display='none';
               post({kind:'nativeNavigation'});
               sourceVideoID = '';
+              captionCuesCache.clear();
               seenSources.clear();
               lastSourceInventory = '';
               window.__rayNativePiPOwner = '';
@@ -719,7 +1036,7 @@ final class ViewController: UIViewController, WKNavigationDelegate {
               reportMediaState('navigation');
             }, true);
             for (const type of ['play', 'playing', 'pause', 'ended', 'waiting', 'error',
-                                'volumechange', 'enterpictureinpicture', 'leavepictureinpicture']) {
+                                'volumechange', 'ratechange', 'enterpictureinpicture', 'leavepictureinpicture']) {
               document.addEventListener(type, (event) => {
                 if (!(event.target instanceof HTMLVideoElement)) return;
                 if ((type === 'play' || type === 'playing') &&
@@ -727,6 +1044,7 @@ final class ViewController: UIViewController, WKNavigationDelegate {
                   event.target.pause();
                 }
                 reportMediaState(type);
+                ensureWebPlaybackSettings();
               }, true);
             }
             document.addEventListener('visibilitychange', () => reportMediaState('visibility'), true);
@@ -778,6 +1096,29 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             self.nativePlayback.primeAudioPosition(self.lastMediaState)
             self.maybeAutomaticallyTakeOver()
             #if DEBUG
+            if ProcessInfo.processInfo.environment["YOUTUBE_PLAYBACK_SETTINGS_SMOKE"] == "1",
+               !self.didRunNativeSmokeTest, self.lastMediaState["videoID"] as? String == id {
+                self.didRunNativeSmokeTest = true
+                let script = #"""
+                (() => {
+                  const video = document.querySelector('.html5-video-player video');
+                  if (!video) return false;
+                  try { document.getElementById('movie_player')?.setPlaybackRate?.(1.5); } catch (_) {}
+                  video.playbackRate = 1.5;
+                  return true;
+                })()
+                """#
+                self.webView.evaluateJavaScript(script) { [weak self] _, _ in
+                    guard let self else { return }
+                    // Let the webpage's rate change settle before testing the handoff.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                        guard let self, UIApplication.shared.applicationState == .active,
+                              self.lastMediaState["videoID"] as? String == id else { return }
+                        self.nativePlayback.requestAutomatic(self.lastMediaState, foreground: true)
+                    }
+                }
+                return
+            }
             guard !self.didRunNativeSmokeTest,
                   (ProcessInfo.processInfo.environment["YOUTUBE_NATIVE_PIP_SMOKE"] == "1" ||
                    ProcessInfo.processInfo.environment["YOUTUBE_NATIVE_AUDIO_SMOKE"] == "1" ||
@@ -883,7 +1224,8 @@ final class ViewController: UIViewController, WKNavigationDelegate {
         #if DEBUG
         let env = ProcessInfo.processInfo.environment
         if ["YOUTUBE_NATIVE_PIP_SMOKE", "YOUTUBE_NATIVE_AUDIO_SMOKE",
-            "YOUTUBE_AUTOMATIC_HANDOFF_SMOKE", "YOUTUBE_WEB_ONLY_DIAGNOSTIC"].contains(where: { env[$0] == "1" }) {
+            "YOUTUBE_AUTOMATIC_HANDOFF_SMOKE", "YOUTUBE_WEB_ONLY_DIAGNOSTIC",
+            "YOUTUBE_PLAYBACK_SETTINGS_SMOKE"].contains(where: { env[$0] == "1" }) {
             return
         }
         #endif
@@ -991,6 +1333,26 @@ final class ViewController: UIViewController, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["YOUTUBE_WEB_SETTINGS_SMOKE"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+                self?.webView.evaluateJavaScript(#"""
+                (() => {
+                  window.__rayRefreshWebSettings?.();
+                  const before=window.__rayWebSettingsProbe?.();
+                  document.getElementById('ray-web-playback-settings')?.click();
+                  const panel=document.getElementById('ray-web-playback-settings-panel');
+                  const speed=panel?.querySelector('select[aria-label="播放速度"]');
+                  if (speed) { speed.value='1.5';speed.dispatchEvent(new Event('change',{bubbles:true})); }
+                  return {before,after:window.__rayWebSettingsProbe?.(),
+                    subtitleDisabled:panel?.querySelector('select[aria-label="字幕"]')?.disabled ?? null};
+                })()
+                """#) { value, error in
+                    PlaybackAudioSession.shared.log("WEB_SETTINGS_SMOKE result=\(String(describing: value)) error=\(error != nil)")
+                }
+            }
+        }
+        #endif
         webView.evaluateJavaScript("({url:location.href,ua:navigator.userAgent,title:document.title})") { value, error in
             print("[YouTubeDesktop] page=\(String(describing: value)) error=\(String(describing: error))")
         }

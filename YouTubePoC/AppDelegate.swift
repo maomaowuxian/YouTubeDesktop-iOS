@@ -315,11 +315,42 @@ final class NativeAudioSourceProbe {
 
 
 /// Native PiP owns the actual audio/video and its remote-command session.
-/// WebKit is paused before the handoff; it is restored only on PiP return.
+enum NativePlaybackRate {
+    static let choices: [Float] = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]
+    static func validated(_ value: Double?) -> Float {
+        guard let value, value.isFinite, (0.25...4).contains(value) else { return 1 }
+        return Float(value)
+    }
+}
+
+struct NativeCaptionCue {
+    let start: Double
+    let end: Double
+    let text: String
+
+    static func parse(_ rows: [[String: Any]]) -> [NativeCaptionCue] {
+        rows.prefix(12000).compactMap { row in
+            guard let start = row["start"] as? Double, let end = row["end"] as? Double,
+                  start.isFinite, end.isFinite, start >= 0, end > start,
+                  let text = row["text"] as? String, !text.isEmpty else { return nil }
+            return NativeCaptionCue(start: start, end: end, text: String(text.prefix(800)))
+        }.sorted { $0.start < $1.start }
+    }
+
+    static func text(at time: Double, cues: [NativeCaptionCue]) -> String {
+        guard time.isFinite else { return "" }
+        return cues.filter { $0.start <= time && time < $0.end }
+            .suffix(3).map(\.text).joined(separator: "\n")
+    }
+}
+
+/// WebKit is paused before the handoff; settings follow the active playback owner.
 private final class NativePlayerSurface: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
     private var audioPauseButton: UIButton?
+    private var settingsButton: UIButton?
+    private let captionLabel = UILabel()
 
     func configureAudioControls(onToggle: @escaping () -> Void, onReturn: @escaping () -> Void) {
         let pause = UIButton(type: .system)
@@ -345,10 +376,54 @@ private final class NativePlayerSurface: UIView {
             controls.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8)
         ])
         audioPauseButton = pause
+
+        let settings = UIButton(type: .system)
+        var config = UIButton.Configuration.filled()
+        config.image = UIImage(systemName: "gearshape.fill")
+        config.imagePadding = 6
+        config.baseBackgroundColor = UIColor.black.withAlphaComponent(0.7)
+        config.baseForegroundColor = .white
+        config.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12)
+        settings.configuration = config
+        settings.accessibilityLabel = "播放设置，倍速和字幕"
+        settings.showsMenuAsPrimaryAction = true
+        settings.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(settings)
+        NSLayoutConstraint.activate([
+            settings.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            settings.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+            settings.heightAnchor.constraint(greaterThanOrEqualToConstant: 44)
+        ])
+        settingsButton = settings
+
+        captionLabel.font = .systemFont(ofSize: 18, weight: .semibold)
+        captionLabel.textColor = .white
+        captionLabel.backgroundColor = UIColor.black.withAlphaComponent(0.7)
+        captionLabel.textAlignment = .center
+        captionLabel.numberOfLines = 3
+        captionLabel.isHidden = true
+        captionLabel.isUserInteractionEnabled = false
+        captionLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(captionLabel)
+        NSLayoutConstraint.activate([
+            captionLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            captionLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            captionLabel.bottomAnchor.constraint(equalTo: settings.topAnchor, constant: -6)
+        ])
     }
 
     func updateAudioControls(playing: Bool) {
         audioPauseButton?.setTitle(playing ? "暂停" : "播放", for: .normal)
+    }
+
+    func updateSettings(rate: Float, menu: UIMenu) {
+        settingsButton?.setTitle("\(rate.formatted())×", for: .normal)
+        settingsButton?.menu = menu
+    }
+
+    func showCaption(_ text: String) {
+        captionLabel.text = text
+        captionLabel.isHidden = text.isEmpty
     }
 }
 
@@ -405,6 +480,15 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
     private var resumeGeneration = 0
     private var resumePending = false
     private var resumeTask: UIBackgroundTaskIdentifier = .invalid
+    private var preferredPlaybackRate: Float = 1
+    private var captionTracks: [[String: Any]] = []
+    private var selectedCaptionID = ""
+    private var captionsChanged = false
+    private var captionCues: [NativeCaptionCue] = []
+    private var captionGeneration = 0
+    private var captionLoading = false
+    private var captionLoadFailed = false
+    private var captionTimeObserver: Any?
 
     func updateAudioState(_ state: [String: Any]) {
         guard !ownsPlayback, state["videoID"] as? String == videoID,
@@ -589,6 +673,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         audioActivated = false
         deferredRestoreScript = nil
         handoffCompleted = false
+        preferredPlaybackRate = NativePlaybackRate.validated(state["playbackRate"] as? Double)
         ownsPlayback = true
         player.audiovisualBackgroundPlaybackPolicy = mode == .audio ? .continuesIfPossible : .automatic
         log("handoff requested mode=\(mode.rawValue) automatic=\(automatic)")
@@ -632,8 +717,18 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
                 return
             }
             self.log("AUDIO_TRACK atomic selection verified")
+            self.preferredPlaybackRate = NativePlaybackRate.validated(snapshot["playbackRate"] as? Double)
+            player.defaultRate = self.preferredPlaybackRate
+            player.currentItem?.audioTimePitchAlgorithm = .spectral
+            self.log("SETTINGS handoff rate=\(self.preferredPlaybackRate)")
             self.wantsPlaying = snapshot["wasPlaying"] as? Bool ?? true
             self.handoffTime = time
+            if self.preferredPlaybackRate > 2 && player.currentItem?.canPlayFastForward != true {
+                self.automaticSuppressedVideoID = self.videoID
+                self.finish(restorePlaying: self.wantsPlaying)
+                self.fail("当前视频流不支持这个倍速，已保留网页播放。")
+                return
+            }
             if automatic && self.automaticCancellationRequested {
                 self.finish(restorePlaying: self.wantsPlaying)
                 return
@@ -681,6 +776,8 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
                     self.automaticSuppressedVideoID = self.videoID
                     self.finish(restorePlaying: self.wantsPlaying)
                 })
+                self.configureCaptions(snapshot["captions"] as? [String: Any] ?? [:])
+                self.updateSettingsMenu()
             }
             do {
                 // WebKit has really paused. Automatic handoff races the background
@@ -734,7 +831,12 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
                         return
                     }
                     self.handoffCompleted = true
-                    if self.wantsPlaying { player.play() }
+                    if self.wantsPlaying { self.startRequestedPlayback(player) }
+                    #if DEBUG
+                    if ProcessInfo.processInfo.environment["YOUTUBE_PLAYBACK_SETTINGS_SMOKE"] == "1" {
+                        self.runSettingsSmoke(token: token)
+                    }
+                    #endif
                     self.surface?.updateAudioControls(playing: self.wantsPlaying)
                     self.activateSession()
                     if self.mode == .pip {
@@ -767,7 +869,141 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
     private func updateAudioPresentation(background: Bool) {
         guard ownsPlayback, mode == .audio, let surface else { return }
         surface.playerLayer.player = background ? nil : player
+        if background { removeCaptionObserver() } else { installCaptionObserver() }
         log("audio presentation attached=\(!background) appState=\(UIApplication.shared.applicationState.rawValue)")
+    }
+
+    private func setPlaybackRate(_ rate: Float) {
+        guard ownsPlayback, let player else { return }
+        preferredPlaybackRate = NativePlaybackRate.validated(Double(rate))
+        player.defaultRate = preferredPlaybackRate
+        // Changing settings on a paused video must not start playback.
+        if wantsPlaying { startRequestedPlayback(player) }
+        webView?.callAsyncJavaScript("return window.__raySetNativePlaybackRate?.(videoID, rate) ?? false;",
+            arguments: ["videoID": videoID, "rate": Double(preferredPlaybackRate)], in: nil, in: .page)
+        log("SETTINGS speed changed rate=\(preferredPlaybackRate) playing=\(wantsPlaying)")
+        updateSettingsMenu()
+    }
+
+    #if DEBUG
+    private func runSettingsSmoke(token: Int) {
+        log("SETTINGS_SMOKE handoff rate=\(player?.rate ?? -1) default=\(player?.defaultRate ?? -1) tracks=\(captionTracks.count) menu=\(surface != nil)")
+        // An explicit play also checks recovery if the device interrupted startup.
+        for (delay, action) in [(1.0, "play"), (3.0, "speed"), (5.0, "pause"), (6.0, "pausedSpeed"),
+                                (8.0, "play"), (12.0, "captions"), (30.0, "return")] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.generation == token, self.ownsPlayback,
+                      UIApplication.shared.applicationState == .active else { return }
+                switch action {
+                case "speed": self.setPlaybackRate(2)
+                case "pause": self.command("pause")
+                case "pausedSpeed": self.setPlaybackRate(0.75)
+                case "play": self.command("play")
+                case "captions":
+                    if let id = self.captionTracks.first?["id"] as? String { self.selectCaption(id) }
+                default:
+                    self.log("SETTINGS_SMOKE before return rate=\(self.player?.rate ?? -1) cues=\(self.captionCues.count)")
+                    self.finish(restorePlaying: false)
+                    return
+                }
+                self.log("SETTINGS_SMOKE \(action) actual=\(self.player?.rate ?? -1) preferred=\(self.preferredPlaybackRate) playing=\(self.wantsPlaying)")
+            }
+        }
+    }
+    #endif
+
+    private func updateSettingsMenu() {
+        let speeds = NativePlaybackRate.choices.map { rate in
+            UIAction(title: "\(rate.formatted())×", state: rate == preferredPlaybackRate ? .on : .off) { [weak self] _ in
+                self?.setPlaybackRate(rate)
+            }
+        }
+        var subtitles = [UIAction(title: "关闭", state: selectedCaptionID.isEmpty ? .on : .off) { [weak self] _ in
+            self?.selectCaption("")
+        }]
+        for track in captionTracks {
+            guard let id = track["id"] as? String else { continue }
+            subtitles.append(UIAction(title: track["name"] as? String ?? "字幕",
+                state: selectedCaptionID == id ? .on : .off) { [weak self] _ in self?.selectCaption(id) })
+        }
+        if captionTracks.isEmpty {
+            subtitles.append(UIAction(title: "此视频暂无可用字幕", attributes: .disabled) { _ in })
+        }
+        let title = captionLoading ? "字幕（加载中）" : captionLoadFailed ? "字幕（加载失败，可重试）" : "字幕"
+        surface?.updateSettings(rate: preferredPlaybackRate, menu: UIMenu(children: [
+            UIMenu(title: "播放速度", children: speeds), UIMenu(title: title, children: subtitles)
+        ]))
+    }
+
+    private func configureCaptions(_ settings: [String: Any]) {
+        captionTracks = Array((settings["tracks"] as? [[String: Any]] ?? []).prefix(50))
+        captionsChanged = false
+        selectedCaptionID = ""
+        captionCues = []
+        captionLoading = false
+        captionLoadFailed = false
+        if settings["enabled"] as? Bool == true, let id = settings["selectedID"] as? String,
+           captionTracks.contains(where: { $0["id"] as? String == id }) {
+            selectCaption(id, userInitiated: false)
+        }
+    }
+
+    private func selectCaption(_ id: String, userInitiated: Bool = true) {
+        guard ownsPlayback, mode == .audio,
+              id.isEmpty || captionTracks.contains(where: { $0["id"] as? String == id }) else { return }
+        captionGeneration += 1
+        let request = captionGeneration
+        let token = generation
+        selectedCaptionID = id
+        if userInitiated { captionsChanged = true }
+        captionCues = []
+        captionLoadFailed = false
+        captionLoading = !id.isEmpty
+        removeCaptionObserver()
+        surface?.showCaption("")
+        updateSettingsMenu()
+        guard !id.isEmpty, let webView else { return }
+        // Fetch via the current webpage session. Signed track URLs never cross diagnostics.
+        webView.callAsyncJavaScript("return await window.__rayLoadNativeCaptions?.(videoID, trackID);",
+            arguments: ["videoID": videoID, "trackID": id], in: nil, in: .page) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self, self.ownsPlayback, self.generation == token,
+                      self.captionGeneration == request, self.selectedCaptionID == id else { return }
+                self.captionLoading = false
+                if case .success(let value) = result,
+                   let payload = value as? [String: Any], payload["videoID"] as? String == self.videoID,
+                   let rows = payload["cues"] as? [[String: Any]] {
+                    self.captionCues = NativeCaptionCue.parse(rows)
+                }
+                self.captionLoadFailed = self.captionCues.isEmpty
+                self.log("SETTINGS captions loaded count=\(self.captionCues.count) success=\(!self.captionLoadFailed)")
+                self.installCaptionObserver()
+                self.updateSettingsMenu()
+                if self.captionLoadFailed && userInitiated {
+                    self.onError?("这条字幕暂时无法加载，可重试或返回网页使用字幕。")
+                }
+            }
+        }
+    }
+
+    private func removeCaptionObserver() {
+        if let captionTimeObserver, let player { player.removeTimeObserver(captionTimeObserver) }
+        captionTimeObserver = nil
+    }
+
+    private func installCaptionObserver() {
+        guard ownsPlayback, mode == .audio, !captionCues.isEmpty, !selectedCaptionID.isEmpty,
+              captionTimeObserver == nil, UIApplication.shared.applicationState == .active,
+              let player else { return }
+        let token = generation
+        surface?.showCaption(NativeCaptionCue.text(at: player.currentTime().seconds, cues: captionCues))
+        captionTimeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self] time in
+            DispatchQueue.main.async {
+                guard let self, self.ownsPlayback, self.generation == token,
+                      UIApplication.shared.applicationState == .active else { return }
+                self.surface?.showCaption(NativeCaptionCue.text(at: time.seconds, cues: self.captionCues))
+            }
+        }
     }
 
     private func installSession(_ state: [String: Any], player: AVPlayer) {
@@ -802,6 +1038,15 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
             return .success
         }
         commandTargets.append((center.changePlaybackPositionCommand, seekTarget))
+        center.changePlaybackRateCommand.supportedPlaybackRates = NativePlaybackRate.choices.map { NSNumber(value: $0) }
+        center.changePlaybackRateCommand.isEnabled = true
+        let rateTarget = center.changePlaybackRateCommand.addTarget { [weak self] event in
+            guard let self, let event = event as? MPChangePlaybackRateCommandEvent,
+                  event.playbackRate.isFinite, (0.25...2).contains(event.playbackRate) else { return .commandFailed }
+            DispatchQueue.main.async { self.setPlaybackRate(event.playbackRate) }
+            return .success
+        }
+        commandTargets.append((center.changePlaybackRateCommand, rateTarget))
         let notifications = NotificationCenter.default
         if mode == .audio {
             notificationObservers.append(notifications.addObserver(forName: UIApplication.willResignActiveNotification,
@@ -910,8 +1155,9 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
     private func startRequestedPlayback(_ player: AVPlayer) {
         // Bypass the HLS stall prediction only when media is actually buffered.
         // Keep AVPlayer's normal loading behavior when the buffer is empty.
+        player.defaultRate = preferredPlaybackRate
         if player.currentItem?.isPlaybackBufferEmpty == false {
-            player.playImmediately(atRate: 1)
+            player.playImmediately(atRate: preferredPlaybackRate)
         } else {
             player.play()
         }
@@ -955,12 +1201,22 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         cancelResumeRequest()
         generation += 1
         let id = videoID
+        let rateArgument = String(preferredPlaybackRate)
+        let captionArgument = captionsChanged ? quote(selectedCaptionID) : "null"
         let elapsed = handoffCompleted ? player?.currentTime().seconds : handoffTime
         let wasAutomatic = automaticHandoff
         if wasAutomatic { automaticRetryAfter = Date().addingTimeInterval(15) }
         endHandoffTask()
         ownsPlayback = false
         handoffCompleted = false
+        captionGeneration += 1
+        removeCaptionObserver()
+        captionCues = []
+        captionTracks = []
+        selectedCaptionID = ""
+        captionsChanged = false
+        captionLoading = false
+        captionLoadFailed = false
         player?.pause()
         if let timeObserver, let player { player.removeTimeObserver(timeObserver) }
         timeObserver = nil
@@ -986,7 +1242,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         PlaybackAudioSession.shared.update(playing: false, pip: false)
         let timeArgument = elapsed?.isFinite == true ? String(max(0, elapsed!)) :
             "(window.__rayNativePiPVideo?.currentTime || 0)"
-        let script = "window.__rayRestoreAfterNativePiP?.(\(quote(id)), \(timeArgument), \(restorePlaying ? "true" : "false"))"
+        let script = "window.__rayRestoreAfterNativePiP?.(\(quote(id)), \(timeArgument), \(restorePlaying ? "true" : "false"), \(rateArgument), \(captionArgument))"
         if wasAutomatic && UIApplication.shared.applicationState != .active {
             deferredRestoreScript = script
             log("AUTO_HANDOFF restoration deferred until foreground")
