@@ -79,6 +79,8 @@ final class NativeAudioSourceProbe {
     private var audioKey = ""
     private var audioID = ""
     private var audioXtags = ""
+    private var selectedAudioID: String?
+    private var selectedAudioXtags = ""
     private var preferredHeight = 1080
     private var videoID = ""
     private var pip = false
@@ -144,10 +146,29 @@ final class NativeAudioSourceProbe {
         startIfPossible()
     }
 
+    func selectAudio(videoID id: String, webpageAudioKey key: String,
+                     audioID: String, xtags: String) -> Bool {
+        guard id == videoID, key == audioKey, !key.isEmpty,
+              !audioID.isEmpty, audioID.count <= 80,
+              audioID.range(of: #"^[A-Za-z0-9_.-]+$"#, options: .regularExpression) != nil,
+              !xtags.isEmpty, xtags.count <= 160,
+              xtags.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil,
+              candidates.contains(where: { $0.path.hasPrefix("/api/manifest/hls_") }) else { return false }
+        cancel()
+        selectedAudioID = audioID
+        selectedAudioXtags = xtags
+        attempted.removeAll()
+        foundCompatibleSource = false
+        startIfPossible()
+        return true
+    }
+
     private func reset(videoID: String, audioKey: String) {
         cancel()
         self.videoID = videoID
         self.audioKey = audioKey
+        selectedAudioID = nil
+        selectedAudioXtags = ""
         pip = false
         expectedDuration = 0
         candidates.removeAll()
@@ -173,14 +194,15 @@ final class NativeAudioSourceProbe {
     private func startIfPossible() {
         guard pip, expectedDuration.isFinite, expectedDuration > 0,
               task == nil, !foundCompatibleSource,
-              let url = candidates.first(where: { !attempted.contains($0) }) else { return }
+              let url = candidates.first(where: { !attempted.contains($0) &&
+                  (self.selectedAudioID == nil || $0.path.hasPrefix("/api/manifest/hls_")) }) else { return }
         attempted.insert(url)
         activeCandidate = url
         generation += 1
         let currentGeneration = generation
         let expected = expectedDuration
-        let selectedAudioID = audioID
-        let selectedXtags = audioXtags
+        let selectedAudioID = self.selectedAudioID ?? audioID
+        let selectedXtags = self.selectedAudioID == nil ? audioXtags : selectedAudioXtags
         let selectedAudioKey = audioKey
         let selectedHeight = preferredHeight
         let headers = [
@@ -225,6 +247,10 @@ final class NativeAudioSourceProbe {
                     }
                     if manifest.contains("#EXT-X-STREAM-INF:") {
                         let variants = NativeHLSAudioRouting.variants(manifest, baseURL: response.url ?? url)
+                        #if DEBUG
+                        let identities = Array(Set(variants.map { "\($0.audioID):\($0.xtags)" })).sorted().joined(separator: ",")
+                        PlaybackAudioSession.shared.log("AUDIO_TRACK debug manifest identities=\(identities)")
+                        #endif
                         guard let selected = NativeHLSAudioRouting.choose(variants, audioID: selectedAudioID,
                             xtags: selectedXtags, preferredHeight: selectedHeight) else {
                             let identities = Set(variants.map(\.audioID)).sorted().joined(separator: ",")
@@ -235,6 +261,10 @@ final class NativeAudioSourceProbe {
                         PlaybackAudioSession.shared.log("AUDIO_TRACK matched web=\(selectedAudioID) variant=\(selected.audioID) height=\(selected.height) choices=\(variants.count)")
                     } else {
                         // A media playlist is already the exact stream WebKit uses.
+                        // It cannot prove that a requested language was selected.
+                        if self.selectedAudioID != nil {
+                            throw NSError(domain: "NativeAudioRouting", code: 4)
+                        }
                         guard manifest.contains("#EXTINF:") else {
                             throw NSError(domain: "NativeAudioRouting", code: 3)
                         }
@@ -481,6 +511,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
     private var resumePending = false
     private var resumeTask: UIBackgroundTaskIdentifier = .invalid
     private var preferredPlaybackRate: Float = 1
+    private var selectedAudioName = ""
     private var captionTracks: [[String: Any]] = []
     private var selectedCaptionID = ""
     private var captionsChanged = false
@@ -563,6 +594,23 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
             self.pendingRequest = nil
             self.fail("原生播放准备超时，请稍后重试。")
         }
+    }
+
+    func requestSelectedAudio(_ state: [String: Any]) {
+        guard !ownsPlayback, UIApplication.shared.applicationState == .active,
+              let id = state["videoID"] as? String, !id.isEmpty,
+              !(state["ad"] as? Bool ?? false) else { return }
+        // The prepared webpage variant may be ready, but the user chose a
+        // different HLS variant. Wait for that exact player item.
+        preparationGeneration += 1
+        itemObservation?.invalidate()
+        itemObservation = nil
+        player?.replaceCurrentItem(with: nil)
+        player = nil
+        asset = nil
+        webpageSourceURL = nil
+        preparedAudioKey = ""
+        request(state)
     }
 
     /// Pre-seek only while foreground; never start a second audible player.
@@ -674,6 +722,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         deferredRestoreScript = nil
         handoffCompleted = false
         preferredPlaybackRate = NativePlaybackRate.validated(state["playbackRate"] as? Double)
+        selectedAudioName = String((state["audioName"] as? String ?? "").prefix(80))
         ownsPlayback = true
         player.audiovisualBackgroundPlaybackPolicy = mode == .audio ? .continuesIfPossible : .automatic
         log("handoff requested mode=\(mode.rawValue) automatic=\(automatic)")
@@ -930,9 +979,14 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
             subtitles.append(UIAction(title: "此视频暂无可用字幕", attributes: .disabled) { _ in })
         }
         let title = captionLoading ? "字幕（加载中）" : captionLoadFailed ? "字幕（加载失败，可重试）" : "字幕"
-        surface?.updateSettings(rate: preferredPlaybackRate, menu: UIMenu(children: [
-            UIMenu(title: "播放速度", children: speeds), UIMenu(title: title, children: subtitles)
-        ]))
+        var menus = [UIMenu(title: "播放速度", children: speeds),
+                     UIMenu(title: title, children: subtitles)]
+        if !selectedAudioName.isEmpty {
+            menus.append(UIMenu(title: "音轨", children: [
+                UIAction(title: selectedAudioName, state: .on) { _ in }
+            ]))
+        }
+        surface?.updateSettings(rate: preferredPlaybackRate, menu: UIMenu(children: menus))
     }
 
     private func configureCaptions(_ settings: [String: Any]) {
@@ -1230,6 +1284,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         captionsChanged = false
         captionLoading = false
         captionLoadFailed = false
+        selectedAudioName = ""
         player?.pause()
         if let timeObserver, let player { player.removeTimeObserver(timeObserver) }
         timeObserver = nil

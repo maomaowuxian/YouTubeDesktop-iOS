@@ -44,7 +44,7 @@ const sandbox = {URL,AbortController,setTimeout,clearTimeout,
     querySelector:s=>s==='.html5-video-player video'?video:s==='.html5-video-player'?player:null},
   post:()=>{},fetch:async()=>{fetchCalls++;return {ok:true,text:()=>new Promise(resolve=>{resolveBody=resolve;})};}};
 vm.createContext(sandbox);
-vm.runInContext(helper+handoff+'\nthis.read=readAudioTrack;this.captions=readCaptionSettings;this.parse=parseCaptionBody;this.remember=rememberCaptionResponse;this.cache=captionCuesCache;this.webSettings=readWebPlaybackSettings;this.webApply=applyWebPlaybackSetting;this.syncCaptions=syncWebCaptionOverlay;',sandbox);
+vm.runInContext(helper+handoff+'\nthis.read=readAudioTrack;this.captions=readCaptionSettings;this.parse=parseCaptionBody;this.remember=rememberCaptionResponse;this.cache=captionCuesCache;this.webSettings=readWebPlaybackSettings;this.webApply=applyWebPlaybackSetting;this.audioChoices=audioChoicesForVideo;this.syncCaptions=syncWebCaptionOverlay;',sandbox);
 const take = () => sandbox.window.__rayPauseForNativePiP(id,video.currentSrc,sandbox.read().key);
 const restore = (play,rate,captions=null) => sandbox.window.__rayRestoreAfterNativePiP(id,60,play,rate,captions);
 (async () => {
@@ -123,7 +123,16 @@ const restore = (play,rate,captions=null) => sandbox.window.__rayRestoreAfterNat
   }
   sandbox.remember('https://www.youtube.com/api/timedtext?v='+id+'&lang=zh',json,'TESTVIDEO02');
   assert.equal(sandbox.cache.size,1,'Stale request cannot populate a current track');
-  response.videoDetails.videoId='TESTVIDEO02';assert.equal(sandbox.captions(id).tracks.length,0);
+  response.streamingData.adaptiveFormats=[
+    {audioTrack:{id:'en-US.10',displayName:'English'},xtags:'entag'},
+    {audioTrack:{id:'zh-Hant.4',displayName:'中文原始'},xtags:'zhlonger123'},
+    {audioTrack:{id:'zh-Hant.4',displayName:'中文原始'},xtags:'zhshort'}];
+  assert.equal(sandbox.audioChoices(id).length,2,'Repeated audio formats yield two named languages');
+  assert.equal(sandbox.audioChoices(id).find(t=>t.id==='zh-Hant.4').xtags,'zhshort',
+    'Choose the exact plain HLS identity instead of an optional encoded variant');
+  response.videoDetails.videoId='TESTVIDEO02';
+  assert.equal(sandbox.captions(id).tracks.length,0);
+  assert.equal(sandbox.audioChoices(id).length,0,'Previous video cannot provide selectable audio');
   response.videoDetails.videoId=id;
   response.captions={playerCaptionsTracklistRenderer:{captionTracks:[]}};
   sandbox.window.__rayNativePiPOwner='';

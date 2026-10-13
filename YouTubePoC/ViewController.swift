@@ -189,6 +189,24 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             const rate = Number(video?.playbackRate);
             return Number.isFinite(rate) && rate >= 0.25 && rate <= 4 ? rate : 1;
           };
+          const audioChoicesForVideo = (videoID) => {
+            try {
+              const response = document.getElementById('movie_player')?.getPlayerResponse?.();
+              if (response?.videoDetails?.videoId !== videoID) return [];
+              const formats = [...(response.streamingData?.formats || []),
+                ...(response.streamingData?.adaptiveFormats || [])];
+              const choices = new Map();
+              for (const format of formats) {
+                const track = format.audioTrack;
+                const id = String(track?.id || '');
+                const xtags = String(format.xtags || '');
+                if (!/^[A-Za-z0-9_.-]{1,80}$/.test(id) || !/^[A-Za-z0-9_-]{1,160}$/.test(xtags)) continue;
+                if (!choices.has(id) || xtags.length < choices.get(id).xtags.length)
+                  choices.set(id,{id,xtags,name:String(track.displayName || id).slice(0,80)});
+              }
+              return [...choices.values()].slice(0,20);
+            } catch (_) { return []; }
+          };
           const captionTrackID = (track, index) => String(track.vssId ||
             [track.languageCode || 'und', track.kind || '', index].join(':')).slice(0,160);
           const captionTracksForVideo = (videoID) => {
@@ -348,7 +366,8 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             const player = document.querySelector('.html5-video-player');
             if (!videoID || !video || window.__rayNativePiPOwner ||
                 player?.classList.contains('ad-showing')) return null;
-            return {videoID, playbackRate:readPlaybackRate(video), captions:readCaptionSettings(videoID)};
+            return {videoID, playbackRate:readPlaybackRate(video),
+              captions:readCaptionSettings(videoID), audioChoices:audioChoicesForVideo(videoID)};
           };
           let webCaptionOffVideoID = '';
           const observedWebCaptionTracks = new WeakSet();
@@ -956,6 +975,21 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             webSettingsPanel = null;
             webSettingsHost?.setAttribute('aria-expanded','false');
           };
+          const requestWebAudioChoice = (videoID, audioID) => {
+            const current = readWebPlaybackSettings();
+            const choice = current?.audioChoices.find(t => t.id === audioID);
+            const video = document.querySelector('.html5-video-player video');
+            const audio = readAudioTrack();
+            if (!choice || current.videoID !== videoID || !video || !audio.known || !audio.key) return false;
+            const rect = video.getBoundingClientRect();
+            closeWebSettings();
+            post({kind:'nativeAudioTrackRequest', videoID, audioKey:audio.key,
+              audioID:choice.id, audioXtags:choice.xtags, audioName:choice.name,
+              playbackMode:'audio', ad:false,
+              rect:{x:rect.x/innerWidth, y:rect.y/innerHeight,
+                    width:rect.width/innerWidth, height:rect.height/innerHeight}});
+            return true;
+          };
           const ensureWebPlaybackSettings = () => {
             const player = document.querySelector('.html5-video-player');
             const settings = readWebPlaybackSettings();
@@ -971,7 +1005,7 @@ final class ViewController: UIViewController, WKNavigationDelegate {
               const button = document.createElement('button');
               button.id = 'ray-web-playback-settings';
               button.type = 'button';
-              button.setAttribute('aria-label','播放设置，倍速和字幕');
+              button.setAttribute('aria-label','播放设置，倍速、字幕和音轨');
               button.setAttribute('aria-expanded','false');
               button.style.cssText = 'position:absolute;right:8px;bottom:48px;z-index:2147483000;min-width:76px;min-height:44px;padding:8px 12px;border:0;border-radius:8px;background:rgba(0,0,0,.75);color:white;font:16px -apple-system,sans-serif;cursor:pointer;pointer-events:auto;';
               for (const type of ['pointerdown','pointerup','touchstart','touchend'])
@@ -986,11 +1020,11 @@ final class ViewController: UIViewController, WKNavigationDelegate {
                 panel.setAttribute('role','dialog');
                 panel.setAttribute('aria-label','播放设置');
                 const rect = button.getBoundingClientRect();
-                panel.style.cssText = 'position:fixed;z-index:2147483647;width:210px;box-sizing:border-box;padding:12px;border-radius:12px;background:#252525;color:white;font:16px -apple-system,sans-serif;box-shadow:0 4px 20px #0008;';
+                panel.style.cssText = 'position:fixed;z-index:2147483647;width:230px;max-height:calc(100vh - 16px);overflow-y:auto;box-sizing:border-box;padding:12px;border-radius:12px;background:#252525;color:white;font:16px -apple-system,sans-serif;box-shadow:0 4px 20px #0008;';
                 panel.style.right = Math.max(8,innerWidth-rect.right)+'px';
-                panel.style.top = Math.max(8,Math.min(rect.top-174,innerHeight-190))+'px';
+                panel.style.top = Math.max(8,Math.min(rect.top-260,innerHeight-280))+'px';
                 panel.addEventListener('click',e => e.stopPropagation());
-                const addSelect = (title,options,value,onChange,disabled=false) => {
+                const addSelect = (title,options,value,onChange,disabled=false,customChange=null) => {
                   const label = document.createElement('label');
                   label.style.cssText = 'display:block;margin:0 0 8px;font-size:14px;color:white;';
                   label.appendChild(document.createTextNode(title));
@@ -1003,6 +1037,10 @@ final class ViewController: UIViewController, WKNavigationDelegate {
                   }
                   select.value=value;select.disabled=disabled;
                   select.addEventListener('change',() => {
+                    if (customChange) {
+                      if (!customChange(select.value)) closeWebSettings();
+                      return;
+                    }
                     if (!applyWebPlaybackSetting(current.videoID,...onChange(select.value))) {
                       closeWebSettings();return;
                     }
@@ -1019,6 +1057,11 @@ final class ViewController: UIViewController, WKNavigationDelegate {
                 const tracks=current.captions.tracks;
                 addSelect('字幕',tracks.length ? [['','关闭'],...tracks.map(t=>[t.id,t.name])] : [['','此视频暂无可用字幕']],
                   current.captions.enabled ? current.captions.selectedID : '',value=>[null,value],!tracks.length);
+                if (current.audioChoices.length > 1) {
+                  const audioOptions = [['','网页当前音轨'],...current.audioChoices.map(t=>[t.id,t.name])];
+                  addSelect('音轨（切换至原生播放）',audioOptions,'',null,false,
+                    value=>value ? requestWebAudioChoice(current.videoID,value) : true);
+                }
                 document.body.appendChild(panel);
                 webSettingsPanel=panel;button.setAttribute('aria-expanded','true');
               });
@@ -1241,6 +1284,22 @@ final class ViewController: UIViewController, WKNavigationDelegate {
                 var request = self.lastMediaState
                 request.merge(dictionary) { _, new in new }
                 self.nativePlayback.request(request)
+            } else if kind == "nativeAudioTrackRequest" {
+                guard let id = dictionary["videoID"] as? String,
+                      let key = dictionary["audioKey"] as? String,
+                      let audioID = dictionary["audioID"] as? String,
+                      let xtags = dictionary["audioXtags"] as? String,
+                      self.lastMediaState["videoID"] as? String == id,
+                      (self.lastMediaState["audioTrack"] as? [String: Any])?["key"] as? String == key,
+                      !self.nativePlayback.ownsPlayback else { return }
+                guard self.nativeAudioProbe.selectAudio(videoID: id, webpageAudioKey: key,
+                                                        audioID: audioID, xtags: xtags) else {
+                    self.nativePlayback.onError?("音轨来源尚未准备好，请播放片刻后重试。")
+                    return
+                }
+                var request = self.lastMediaState
+                request.merge(dictionary) { _, new in new }
+                self.nativePlayback.requestSelectedAudio(request)
             } else if kind == "nativeNavigation" {
                 self.lastMediaState = [:]
                 self.nativePlayback.navigationWillChange()
