@@ -936,6 +936,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
     }
 
     private func configureCaptions(_ settings: [String: Any]) {
+        disableEmbeddedCaptions()
         captionTracks = Array((settings["tracks"] as? [[String: Any]] ?? []).prefix(50))
         captionsChanged = false
         selectedCaptionID = ""
@@ -945,6 +946,17 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         if settings["enabled"] as? Bool == true, let id = settings["selectedID"] as? String,
            captionTracks.contains(where: { $0["id"] as? String == id }) {
             selectCaption(id, userInitiated: false)
+        }
+    }
+
+    private func disableEmbeddedCaptions() {
+        guard let item = player?.currentItem else { return }
+        Task { [weak self, weak item] in
+            guard let self, let item,
+                  let group = try? await item.asset.loadMediaSelectionGroup(for: .legible),
+                  self.ownsPlayback, self.player?.currentItem === item,
+                  group.allowsEmptySelection else { return }
+            item.select(nil, in: group)
         }
     }
 
@@ -959,6 +971,7 @@ final class NativePiPPlayback: NSObject, AVPictureInPictureControllerDelegate {
         captionCues = []
         captionLoadFailed = false
         captionLoading = !id.isEmpty
+        if id.isEmpty { disableEmbeddedCaptions() }
         removeCaptionObserver()
         surface?.showCaption("")
         updateSettingsMenu()
@@ -1421,10 +1434,6 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         window.makeKeyAndVisible()
         self.window = window
         return true
-    }
-
-    func applicationWillResignActive(_ application: UIApplication) {
-        (window?.rootViewController as? ViewController)?.applicationWillResignActive()
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {

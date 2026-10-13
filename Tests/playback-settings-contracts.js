@@ -7,29 +7,55 @@ new vm.Script(source.split('let pageTweaks = #"""')[1].split('"""#')[0]);
 const helper = source.slice(source.indexOf("          // YouTube's HLS muxed variants"), source.indexOf("          window.__rayNativePiPOwner = '';"));
 const handoff = source.slice(source.indexOf('          window.__rayPauseForNativePiP ='), source.indexOf('          const adSkipSelectors ='));
 const id = 'TESTVIDEO01';
-let ad = false, cc = true, selected = {vssId: '.en', languageCode: 'en'};
+let ad = false, cc = true, captionButtonPresent = true, buttonClicks = 0, unloadCalls = 0;
+let clearOptionChangesButton = false;
+let selected = {vssId: '.en', languageCode: 'en'};
 let response = {videoDetails: {videoId:id}, streamingData: {adaptiveFormats:[]},
   captions:{playerCaptionsTracklistRenderer:{captionTracks:[
     {vssId:'.en',languageCode:'en',name:{simpleText:'English'},baseUrl:'https://www.youtube.com/api/timedtext?v=TESTVIDEO01'},
     {vssId:'.zh',languageCode:'zh',name:{runs:[{text:'中文'}]},baseUrl:'https://www.youtube.com/api/timedtext?v=TESTVIDEO01&lang=zh'}]}}};
-let optionCalls = [], rateCalls = [], fetchCalls = 0, resolveBody = null;
+let optionCalls = [], rateCalls = [], fetchCalls = 0, resolveBody = null, textTrackChange = null;
 const video = {currentSrc:'https://r1.googlevideo.com/api/manifest/hls_playlist/test', currentTime:42,
   duration:120,playbackRate:1.5,paused:false,ended:false,isConnected:true,
+  textTracks:[{mode:'showing'}],
   pause(){this.paused=true;}, play(){this.paused=false;return Promise.resolve();}};
+video.textTracks.addEventListener = (type, callback) => {
+  if (type === 'change') textTrackChange = callback;
+};
+const playerClasses = new Set();
+const rootClasses = new Set();
 const player = {getAudioTrack:()=>({id:'und',xtags:''}), getPlayerResponse:()=>response,
-  getOption:()=>selected,setOption:(...args)=>optionCalls.push(args),loadModule:null,
+  getOption:()=>selected,setOption:(...args)=>{optionCalls.push(args);
+    if (clearOptionChangesButton && !Object.keys(args[2]).length) cc=false;},loadModule:null,
+  unloadModule:()=>unloadCalls++,
+  classList:{contains:name=>name==='ad-showing'?ad:playerClasses.has(name),
+    toggle:(name,enabled)=>enabled?playerClasses.add(name):playerClasses.delete(name)},
+  querySelector:s=>s==='.ytp-subtitles-button'&&captionButtonPresent?captionButton:s==='video'?video:null,
   setPlaybackRate:rate=>rateCalls.push(rate)};
+const captionButton = {getAttribute:()=>String(cc),click:()=>{cc=!cc;buttonClicks++;}};
+let captionStyle = null;
 const sandbox = {URL,AbortController,setTimeout,clearTimeout,
   location:{href:'https://www.youtube.com/watch?v='+id},window:{__rayResetPiPButton:()=>{}},
   navigator:{mediaSession:{metadata:{title:'test'},playbackState:'playing'}},
-  document:{getElementById:()=>player,querySelector:s=>s==='.html5-video-player video'?video:
-    s==='.html5-video-player'?{classList:{contains:()=>ad}}:s==='.ytp-subtitles-button'?{getAttribute:()=>String(cc)}:null},
+  document:{getElementById:key=>key==='movie_player'?player:key==='ray-caption-overlay-style'?captionStyle:null,
+    createElement:()=>({}),head:{appendChild:style=>{captionStyle=style;}},
+    documentElement:{classList:{contains:name=>rootClasses.has(name),
+      toggle:(name,enabled)=>enabled?rootClasses.add(name):rootClasses.delete(name)}},
+    querySelector:s=>s==='.html5-video-player video'?video:s==='.html5-video-player'?player:null},
   post:()=>{},fetch:async()=>{fetchCalls++;return {ok:true,text:()=>new Promise(resolve=>{resolveBody=resolve;})};}};
 vm.createContext(sandbox);
-vm.runInContext(helper+handoff+'\nthis.read=readAudioTrack;this.captions=readCaptionSettings;this.parse=parseCaptionBody;this.remember=rememberCaptionResponse;this.cache=captionCuesCache;this.webSettings=readWebPlaybackSettings;this.webApply=applyWebPlaybackSetting;',sandbox);
+vm.runInContext(helper+handoff+'\nthis.read=readAudioTrack;this.captions=readCaptionSettings;this.parse=parseCaptionBody;this.remember=rememberCaptionResponse;this.cache=captionCuesCache;this.webSettings=readWebPlaybackSettings;this.webApply=applyWebPlaybackSetting;this.syncCaptions=syncWebCaptionOverlay;',sandbox);
 const take = () => sandbox.window.__rayPauseForNativePiP(id,video.currentSrc,sandbox.read().key);
 const restore = (play,rate,captions=null) => sandbox.window.__rayRestoreAfterNativePiP(id,60,play,rate,captions);
 (async () => {
+  cc=false;sandbox.syncCaptions(player,id);
+  assert.equal(video.textTracks[0].mode,'disabled','Initial off button disables a showing text track');
+  assert.equal(typeof textTrackChange,'function','Text track changes are observed');
+  video.textTracks[0].mode='showing';textTrackChange();
+  assert.equal(video.textTracks[0].mode,'disabled','A late YouTube text track is disabled again');
+  cc=true;sandbox.syncCaptions(player,id);
+  video.textTracks[0].mode='showing';textTrackChange();
+  assert.equal(video.textTracks[0].mode,'showing','Explicitly enabled captions remain available');
   for (const rate of [0.5,0.75,1.25,1.5,2,3]) {
     video.paused=false;video.playbackRate=rate;sandbox.window.__rayNativePiPOwner='';
     const snap=take();assert.equal(snap.playbackRate,rate);assert.equal(snap.captions.enabled,true);
@@ -40,7 +66,30 @@ const restore = (play,rate,captions=null) => sandbox.window.__rayRestoreAfterNat
   assert.equal(sandbox.window.__raySetNativePlaybackRate(id,2),true);assert.equal(video.playbackRate,2);assert.equal(video.paused,true);
   restore(true,2,'.zh');assert.equal(video.paused,false);assert.equal(video.playbackRate,2);
   assert.equal(optionCalls.at(-1)[2].vssId,'.zh');
+  clearOptionChangesButton=true;
   take();restore(false,0.75,'');assert.deepEqual(Object.keys(optionCalls.at(-1)[2]),[]);
+  assert.equal(cc,false,'Returning from native with captions off switches off the webpage caption button');
+  assert.equal(buttonClicks,1);
+  assert.equal(playerClasses.has('ray-captions-off'),true,'Rendered caption overlay is hidden');
+  assert.equal(rootClasses.has('ray-captions-off'),true,'An overlay outside the player is also hidden');
+  assert.equal(video.textTracks[0].mode,'disabled','Native web text track is disabled');
+  cc=true;video.textTracks[0].mode='showing';
+  assert.equal(sandbox.webApply(id,null,''),true);
+  assert.equal(cc,false,'Web settings off switches off the webpage caption button');
+  assert.equal(sandbox.captions(id).enabled,false);
+  assert.equal(sandbox.webApply(id,null,''),true);
+  assert.equal(buttonClicks,2,'Applying off twice does not turn captions back on');
+  captionButtonPresent=false;
+  const unloadBefore=unloadCalls;
+  assert.equal(sandbox.webApply(id,null,''),true);
+  assert.equal(unloadCalls,unloadBefore+1,'Without a caption button, unload the caption module');
+  captionButtonPresent=true;cc=true;
+  assert.equal(sandbox.webApply(id,null,'.zh'),true);
+  assert.equal(playerClasses.has('ray-captions-off'),false,'Selecting a track reveals captions');
+  assert.equal(rootClasses.has('ray-captions-off'),false,'Selecting a track reveals external overlays');
+  cc=false;sandbox.syncCaptions(player,id);
+  assert.equal(playerClasses.has('ray-captions-off'),true,'Off button also hides a stale rendered overlay');
+  cc=true;clearOptionChangesButton=false;
   take();const oldRate=video.playbackRate;
   assert.equal(sandbox.window.__raySetNativePlaybackRate(id,NaN),false);assert.equal(video.playbackRate,oldRate);
   sandbox.location.href='https://www.youtube.com/watch?v=TESTVIDEO02';

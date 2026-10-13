@@ -37,6 +37,9 @@ final class ViewController: UIViewController, WKNavigationDelegate {
     private var didRunNativeSmokeTest = false
     private var adSkipClickInFlight = false
     private var lastAdSkipClickAt = Date.distantPast
+    #if DEBUG
+    private var lastCaptionProbeAt = Date.distantPast
+    #endif
 
     init() {
         let config = WKWebViewConfiguration()
@@ -198,8 +201,9 @@ final class ViewController: UIViewController, WKNavigationDelegate {
           const readCaptionSettings = (videoID) => {
             const tracks = captionTracksForVideo(videoID);
             let selected = null;
-            try { selected = document.getElementById('movie_player')?.getOption?.('captions','track'); } catch (_) {}
-            const button = document.querySelector('.ytp-subtitles-button');
+            const player = document.getElementById('movie_player');
+            try { selected = player?.getOption?.('captions','track'); } catch (_) {}
+            const button = player?.querySelector?.('.ytp-subtitles-button');
             const enabled = button ? button.getAttribute('aria-pressed') === 'true' : !!selected?.languageCode;
             let index = tracks.findIndex(t => t.vssId && t.vssId === selected?.vssId);
             if (index < 0) index = tracks.findIndex(t => t.languageCode === selected?.languageCode &&
@@ -346,6 +350,64 @@ final class ViewController: UIViewController, WKNavigationDelegate {
                 player?.classList.contains('ad-showing')) return null;
             return {videoID, playbackRate:readPlaybackRate(video), captions:readCaptionSettings(videoID)};
           };
+          let webCaptionOffVideoID = '';
+          const observedWebCaptionTracks = new WeakSet();
+          const disableShowingWebTextTracks = (player) => {
+            for (const track of player?.querySelector?.('video')?.textTracks || []) {
+              if (track.mode === 'showing') track.mode = 'disabled';
+            }
+          };
+          const setWebCaptionOverlayHidden = (player, hidden) => {
+            if (!document.getElementById('ray-caption-overlay-style')) {
+              const style = document.createElement('style');
+              style.id = 'ray-caption-overlay-style';
+              style.textContent = 'html.ray-captions-off .ytp-caption-window-container, html.ray-captions-off .caption-window, html.ray-captions-off .ytp-caption-segment {visibility:hidden!important}';
+              (document.head || document.documentElement).appendChild(style);
+            }
+            const rootClasses = document.documentElement.classList;
+            if (rootClasses.contains('ray-captions-off') !== hidden)
+              rootClasses.toggle('ray-captions-off', hidden);
+            if (player?.classList.contains('ray-captions-off') !== hidden)
+              player?.classList.toggle('ray-captions-off', hidden);
+          };
+          const syncWebCaptionOverlay = (player, videoID) => {
+            if (!player || !videoID) return;
+            if (webCaptionOffVideoID && webCaptionOffVideoID !== videoID) webCaptionOffVideoID = '';
+            const button = player?.querySelector?.('.ytp-subtitles-button');
+            const hidden = webCaptionOffVideoID === videoID ||
+              button?.getAttribute('aria-pressed') === 'false';
+            setWebCaptionOverlayHidden(player, hidden);
+            const video = player.querySelector('video');
+            const tracks = video?.textTracks;
+            if (tracks && !observedWebCaptionTracks.has(tracks)) {
+              observedWebCaptionTracks.add(tracks);
+              tracks.addEventListener?.('change', () => {
+                const currentID = new URL(location.href).searchParams.get('v') || '';
+                const currentPlayer = document.querySelector('.html5-video-player');
+                if (!currentID || window.__rayNativePiPOwner ||
+                    currentPlayer?.querySelector('video') !== video) return;
+                syncWebCaptionOverlay(currentPlayer, currentID);
+              });
+            }
+            if (hidden) disableShowingWebTextTracks(player);
+          };
+          const disableWebCaptions = (player, videoID) => {
+            webCaptionOffVideoID = videoID;
+            setWebCaptionOverlayHidden(player, true);
+            const button = player?.querySelector?.('.ytp-subtitles-button');
+            try { if (button?.getAttribute('aria-pressed') === 'true') button.click(); } catch (_) {}
+            try { player?.setOption?.('captions','track',{}); } catch (_) {}
+            try { player?.unloadModule?.('captions'); } catch (_) {}
+            syncWebCaptionOverlay(player, videoID);
+          };
+          const enableWebCaptions = (player, track) => {
+            webCaptionOffVideoID = '';
+            setWebCaptionOverlayHidden(player, false);
+            player?.loadModule?.('captions');
+            const button = player?.querySelector?.('.ytp-subtitles-button');
+            if (button?.getAttribute('aria-pressed') === 'false') button.click();
+            player?.setOption?.('captions','track',track);
+          };
           const applyWebPlaybackSetting = (videoID, rate = null, captionID = null) => {
             const settings = readWebPlaybackSettings();
             if (!settings || settings.videoID !== videoID) return false;
@@ -361,8 +423,9 @@ final class ViewController: UIViewController, WKNavigationDelegate {
               const index = tracks.findIndex((t,i) => captionTrackID(t,i) === captionID);
               if (captionID && index < 0) return false;
               try {
-                if (captionID) player?.loadModule?.('captions');
-                player?.setOption?.('captions','track',captionID ? tracks[index] : {});
+                if (captionID) {
+                  enableWebCaptions(player,tracks[index]);
+                } else disableWebCaptions(player,videoID);
               } catch (_) { return false; }
             }
             return true;
@@ -384,7 +447,7 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             const pipButton = document.querySelector('.ray-pip-button');
             if (pipButton) { pipButton.disabled = false; pipButton.title = '画中画 / 后台播放'; }
             const audioButton = document.querySelector('.ray-audio-button');
-            if (audioButton) { audioButton.disabled = false; audioButton.title = '后台音频'; }
+            if (audioButton) { audioButton.disabled = false; audioButton.title = '点击切换后台播放'; }
           };
           window.__rayPauseForNativePiP = (videoID, automaticSource = '', expectedAudioKey = '') => {
             if (new URL(location.href).searchParams.get('v') !== videoID ||
@@ -432,13 +495,12 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             if (captionID !== null) {
               try {
                 if (!captionID) {
-                  player?.setOption?.('captions','track',{});
+                  disableWebCaptions(player,videoID);
                 } else {
                   const tracks = captionTracksForVideo(videoID);
                   const index = tracks.findIndex((t,i) => captionTrackID(t,i) === captionID);
                   if (index >= 0) {
-                    player?.loadModule?.('captions');
-                    player?.setOption?.('captions','track',tracks[index]);
+                    enableWebCaptions(player,tracks[index]);
                   }
                 }
               } catch (_) {}
@@ -859,8 +921,8 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             const button = document.createElement('button');
             button.type = 'button';
             button.className = 'ytp-button ray-audio-button';
-            button.setAttribute('aria-label', '后台音频');
-            button.setAttribute('title', '后台音频');
+            button.setAttribute('aria-label', '点击切换后台播放');
+            button.setAttribute('title', '点击切换后台播放');
             button.style.width = '48px';
             button.style.padding = '0 8px';
             button.innerHTML = '<svg viewBox="0 0 36 36" width="100%" height="100%" aria-hidden="true"><path fill="currentColor" d="M18 7a11 11 0 0 0-11 11v9h7V16h-4a8 8 0 0 1 16 0h-4v11h7v-9A11 11 0 0 0 18 7z"></path></svg>';
@@ -902,6 +964,7 @@ final class ViewController: UIViewController, WKNavigationDelegate {
               closeWebSettings();
               return;
             }
+            syncWebCaptionOverlay(player, settings.videoID);
             if (!webSettingsHost || webSettingsHost.parentElement !== player) {
               webSettingsHost?.remove();
               closeWebSettings();
@@ -1020,6 +1083,8 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             document.addEventListener('yt-navigate-start', () => {
               closeWebSettings();
               if (webSettingsHost) webSettingsHost.style.display='none';
+              webCaptionOffVideoID = '';
+              setWebCaptionOverlayHidden(document.querySelector('.html5-video-player'), false);
               post({kind:'nativeNavigation'});
               sourceVideoID = '';
               captionCuesCache.clear();
@@ -1034,6 +1099,13 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             document.addEventListener('yt-navigate-finish', () => {
               scheduleRefresh();
               reportMediaState('navigation');
+            }, true);
+            document.addEventListener('click', event => {
+              const button = event.target instanceof Element ? event.target.closest('.ytp-subtitles-button') : null;
+              if (!event.isTrusted || !button) return;
+              webCaptionOffVideoID = '';
+              setTimeout(() => syncWebCaptionOverlay(button.closest('.html5-video-player'),
+                new URL(location.href).searchParams.get('v') || ''), 0);
             }, true);
             for (const type of ['play', 'playing', 'pause', 'ended', 'waiting', 'error',
                                 'volumechange', 'ratechange', 'enterpictureinpicture', 'leavepictureinpicture']) {
@@ -1051,6 +1123,11 @@ final class ViewController: UIViewController, WKNavigationDelegate {
             let lastProgressLogAt = 0;
             document.addEventListener('timeupdate', (event) => {
               if (!(event.target instanceof HTMLVideoElement)) return;
+              const currentID = new URL(location.href).searchParams.get('v') || '';
+              const player = document.querySelector('.html5-video-player');
+              if (currentID && !window.__rayNativePiPOwner &&
+                  player?.querySelector('video') === event.target)
+                syncWebCaptionOverlay(player, currentID);
               const now = Date.now();
               const interval = event.target.webkitPresentationMode === 'picture-in-picture' ? 15000 : 5000;
               if (now - lastProgressLogAt < interval) return;
@@ -1094,7 +1171,6 @@ final class ViewController: UIViewController, WKNavigationDelegate {
         nativePlayback.onReady = { [weak self] id in
             guard let self else { return }
             self.nativePlayback.primeAudioPosition(self.lastMediaState)
-            self.maybeAutomaticallyTakeOver()
             #if DEBUG
             if ProcessInfo.processInfo.environment["YOUTUBE_PLAYBACK_SETTINGS_SMOKE"] == "1",
                !self.didRunNativeSmokeTest, self.lastMediaState["videoID"] as? String == id {
@@ -1218,30 +1294,9 @@ final class ViewController: UIViewController, WKNavigationDelegate {
         webView.load(URLRequest(url: initialURL))
     }
 
-    private func maybeAutomaticallyTakeOver() {
-        guard UIApplication.shared.applicationState == .active,
-              presentedViewController == nil, !nativePlayback.ownsPlayback else { return }
-        #if DEBUG
-        let env = ProcessInfo.processInfo.environment
-        if ["YOUTUBE_NATIVE_PIP_SMOKE", "YOUTUBE_NATIVE_AUDIO_SMOKE",
-            "YOUTUBE_AUTOMATIC_HANDOFF_SMOKE", "YOUTUBE_WEB_ONLY_DIAGNOSTIC",
-            "YOUTUBE_PLAYBACK_SETTINGS_SMOKE"].contains(where: { env[$0] == "1" }) {
-            return
-        }
-        #endif
-        // Complete the audible handoff while foreground. Locking only detaches
-        // the video surface; it no longer depends on a late WebKit snapshot.
-        nativePlayback.requestAutomatic(lastMediaState, foreground: true)
-    }
-
-    func applicationWillResignActive() {
-        nativePlayback.requestAutomatic(lastMediaState)
-    }
-
     func applicationBecameActive() {
         nativePlayback.applicationBecameActive()
         nativeAudioProbe.update(lastMediaState)
-        maybeAutomaticallyTakeOver()
     }
 
     private func handleMediaState(_ state: [String: Any]) {
@@ -1249,13 +1304,56 @@ final class ViewController: UIViewController, WKNavigationDelegate {
         nativePlayback.updateAudioState(state)
         nativeAudioProbe.update(state)
         nativePlayback.primeAudioPosition(state)
-        maybeAutomaticallyTakeOver()
         if !nativePlayback.ownsPlayback {
             PlaybackAudioSession.shared.update(playing: !(state["paused"] as? Bool ?? true),
                                                pip: state["pip"] as? Bool ?? false)
         }
         PlaybackAudioSession.shared.log("JS \(state)")
+        #if DEBUG
+        probeCaptionAndAudio(state)
+        #endif
     }
+
+    #if DEBUG
+    private func probeCaptionAndAudio(_ state: [String: Any]) {
+        guard UIApplication.shared.applicationState == .active, !nativePlayback.ownsPlayback,
+              let event = state["event"] as? String,
+              ["settings", "playing", "navigation", "progress"].contains(event) else { return }
+        let now = Date()
+        if event != "settings" && now.timeIntervalSince(lastCaptionProbeAt) < 4 { return }
+        lastCaptionProbeAt = now
+        let script = #"""
+        (() => {
+          const player = document.getElementById('movie_player');
+          const video = player?.querySelector('video');
+          const button = player?.querySelector('.ytp-subtitles-button');
+          const nodes = [...document.querySelectorAll('[class*="caption"],[class*="subtitle"]')].slice(0,200);
+          const visible = node => {
+            const style = getComputedStyle(node);
+            const rect = node.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+          };
+          const safeClass = node => String(node.className || '').replace(/[^A-Za-z0-9 _-]/g,'').slice(0,80);
+          const samples = nodes.filter(visible).slice(-12).map(node => ({cls:safeClass(node),inside:!!player?.contains(node),y:Math.round(node.getBoundingClientRect().y)}));
+          const hash = value => { let h=0; for (const c of String(value || '')) h=(Math.imul(h,31)+c.charCodeAt(0))|0; return h.toString(16); };
+          const videos = [...document.querySelectorAll('video')].slice(0,8).map(v => ({playing:!v.paused,muted:v.muted,time:Math.round(v.currentTime || 0),source:hash(v.currentSrc)}));
+          let internalCC = null, audioID = '';
+          try { internalCC = player?.isSubtitlesOn?.() ?? null; audioID = String(player?.getAudioTrack?.()?.id || '').slice(0,40); } catch (_) {}
+          return JSON.stringify({videoTime:Math.round(video?.currentTime || 0),button:button?.getAttribute('aria-pressed') ?? 'missing',internalCC,
+            playerOff:!!player?.classList.contains('ray-captions-off'),rootOff:document.documentElement.classList.contains('ray-captions-off'),
+            style:!!document.getElementById('ray-caption-overlay-style'),nodes:nodes.length,samples,
+            textTracks:[...(video?.textTracks || [])].map(t => t.mode).slice(0,8),audioID,videos});
+        })()
+        """#
+        webView.evaluateJavaScript(script) { value, error in
+            if let payload = value as? String {
+                PlaybackAudioSession.shared.log("CAPTION_AUDIO_PROBE event=\(event) \(payload)")
+            } else if error != nil {
+                PlaybackAudioSession.shared.log("CAPTION_AUDIO_PROBE event=\(event) unavailable")
+            }
+        }
+    }
+    #endif
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         lastMediaState = [:]
